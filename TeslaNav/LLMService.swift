@@ -1,0 +1,110 @@
+import Foundation
+
+class LLMService {
+    private let baseURL = "https://api.anthropic.com/v1/messages"
+
+    static let systemPrompt = """
+    You are a vehicle navigation assistant. The user will describe where they want to drive — \
+    destinations, errands, stops along the way, route preferences, or any combination.
+
+    Return a JSON object with this exact structure:
+    {
+      "origin": "starting address or null",
+      "stops": [
+        {
+          "id": "unique-uuid",
+          "address": "full street address if known, or best description",
+          "label": "short display name (e.g. Costco, Home, Airport)",
+          "notes": "user context about this stop, or null",
+          "stopType": "specific or search",
+          "searchQuery": "what to search for if stopType is search, or null",
+          "openTime": "HH:MM 24h if time constraint mentioned, or null",
+          "closeTime": "HH:MM 24h if time constraint mentioned, or null",
+          "dwellMinutes": 20,
+          "estimatedArrival": null,
+          "driveMinutesFromPrev": null,
+          "hasConflict": false
+        }
+      ],
+      "preferences": {
+        "scenic": false,
+        "avoidHighways": false,
+        "avoidTolls": false,
+        "avoidFerries": false,
+        "preferenceNotes": "any route preference context, or null"
+      },
+      "notes": "any warnings, or null"
+    }
+
+    Stop types:
+    - "specific": user gave an exact address or well-known named location you can geocode \
+    (e.g. "Tesla HQ", "123 Main St", "SFO airport"). Set address to the full geocodable address.
+    - "search": user wants a type of place along the route, not a specific one \
+    (e.g. "stop at a Starbucks", "get gas", "find a good lunch spot"). \
+    Set searchQuery to the search term (e.g. "Starbucks", "gas station", "restaurant"). \
+    Set address to the searchQuery as a placeholder — the backend will resolve the actual location.
+
+    Route preferences:
+    - "scenic route" / "take the scenic way" → scenic: true, avoidHighways: true
+    - "avoid tolls" → avoidTolls: true
+    - "take the highway" / "fastest route" → all false (defaults)
+    - "avoid the freeway" → avoidHighways: true
+    - Any other route context → put in preferenceNotes
+
+    Rules:
+    - Preserve the user's intended stop order
+    - Make addresses as complete as possible (city, state, ZIP when inferrable)
+    - label = shortest recognizable name
+    - dwellMinutes: default 20, "quick stop" → 5, "grab coffee" → 10, "lunch" → 45
+    - Return ONLY valid JSON, no markdown, no explanation
+    - If nothing found: {"origin": null, "stops": [], "preferences": null, "notes": "No destinations found"}
+    """
+
+    func parsePrompt(_ prompt: String, apiKey: String) async throws -> ParsedRoute {
+        guard !apiKey.isEmpty else { throw LLMError.noApiKey }
+
+        let request = ClaudeRequest(
+            model: "claude-haiku-4-5-20251001",
+            maxTokens: 1024,
+            system: LLMService.systemPrompt,
+            messages: [ClaudeMessage(role: "user", content: prompt)]
+        )
+
+        var urlRequest = URLRequest(url: URL(string: baseURL)!)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        urlRequest.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.timeoutInterval = 15
+        urlRequest.httpBody = try JSONEncoder().encode(request)
+
+        let (data, resp) = try await URLSession.shared.data(for: urlRequest)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw LLMError.apiError(String(data: data, encoding: .utf8) ?? "Unknown")
+        }
+
+        let claude = try JSONDecoder().decode(ClaudeResponse.self, from: data)
+        guard let text = claude.content.first?.text else { throw LLMError.emptyResponse }
+
+        let json = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let jsonData = json.data(using: .utf8) else { throw LLMError.parseError }
+        return try JSONDecoder().decode(ParsedRoute.self, from: jsonData)
+    }
+
+    enum LLMError: LocalizedError {
+        case noApiKey, apiError(String), emptyResponse, parseError
+        var errorDescription: String? {
+            switch self {
+            case .noApiKey: return "No Claude API key — add one in Settings"
+            case .apiError(let msg): return "API error: \(msg)"
+            case .emptyResponse: return "Empty response from Claude"
+            case .parseError: return "Could not parse response"
+            }
+        }
+    }
+}
