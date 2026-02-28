@@ -3,10 +3,13 @@ import Foundation
 struct ResolvedRoute {
     let stops: [RouteStop]
     let totalDriveMin: Int?
+    let totalDistanceKm: Double?
 }
 
+@MainActor
 class TeslaService: ObservableObject {
     @Published var vehicles: [TeslaVehicle] = []
+    @Published var vehicleStatus: [Int: VehicleStatusData] = [:]
     @Published var isLoading = false
     @Published var lastError: String?
 
@@ -24,8 +27,11 @@ class TeslaService: ObservableObject {
     }
 
     private func authHeaders() -> [String: String] {
-        ["Authorization": "Bearer \(AppSettings.current.teslaAccessToken)",
-         "Content-Type": "application/json"]
+        var h = ["Authorization": "Bearer \(AppSettings.current.teslaAccessToken)",
+                 "Content-Type": "application/json"]
+        let gmKey = AppSettings.current.googleMapsApiKey
+        if !gmKey.isEmpty { h["X-Google-Maps-Key"] = gmKey }
+        return h
     }
 
     private func request(path: String, method: String = "GET", body: Data? = nil) -> URLRequest {
@@ -39,22 +45,19 @@ class TeslaService: ObservableObject {
     // MARK: - Load Vehicles
 
     func loadVehicles() async {
-        await MainActor.run { isLoading = true; lastError = nil }
+        isLoading = true
+        lastError = nil
 
         do {
             let req = request(path: "/vehicles")
             let (data, _) = try await Self.session.data(for: req)
             let response = try JSONDecoder().decode(TeslaVehiclesResponse.self, from: data)
-
-            await MainActor.run {
-                self.vehicles = response.response
-                self.isLoading = false
-            }
+            vehicles = response.response
+            isLoading = false
+            await loadAllVehicleData()
         } catch {
-            await MainActor.run {
-                self.lastError = error.localizedDescription
-                self.isLoading = false
-            }
+            lastError = error.localizedDescription
+            isLoading = false
         }
     }
 
@@ -62,14 +65,21 @@ class TeslaService: ObservableObject {
 
     func wakeVehicle(_ vehicleId: String) async throws {
         let req = request(path: "/vehicles/\(vehicleId)/wake", method: "POST")
-        let (data, _) = try await Self.session.data(for: req)
+        let (data, resp) = try await Self.session.data(for: req)
 
-        struct WakeResp: Codable { struct R: Codable { let state: String }; let response: R }
-        let resp = try JSONDecoder().decode(WakeResp.self, from: data)
-
-        if resp.response.state != "online" {
-            try await Task.sleep(nanoseconds: 3_000_000_000)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            let msg = String(data: data, encoding: .utf8) ?? "Wake failed"
+            throw TeslaError.commandFailed(msg)
         }
+
+        // Check if already online, otherwise wait for wake
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let response = json["response"] as? [String: Any],
+           let state = response["state"] as? String,
+           state == "online" {
+            return
+        }
+        try await Task.sleep(nanoseconds: 3_000_000_000)
     }
 
     // MARK: - Send Navigation
@@ -86,6 +96,56 @@ class TeslaService: ObservableObject {
             let msg = String(data: data, encoding: .utf8) ?? "Failed"
             throw TeslaError.commandFailed(msg)
         }
+    }
+
+    // MARK: - Vehicle Data
+
+    func loadVehicleData(_ vehicleId: String) async {
+        do {
+            let req = request(path: "/vehicles/\(vehicleId)/vehicle_data")
+            let (data, resp) = try await Self.session.data(for: req)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
+            let status = try JSONDecoder().decode(VehicleStatusData.self, from: data)
+            if let id = Int(vehicleId) {
+                vehicleStatus[id] = status
+            }
+        } catch { /* silently fail — status is optional */ }
+    }
+
+    func loadAllVehicleData() async {
+        for vehicle in vehicles where vehicle.isOnline {
+            await loadVehicleData(vehicle.idString)
+        }
+    }
+
+    // MARK: - Climate Control
+
+    func setClimate(_ vehicleId: String, on: Bool, tempC: Double? = nil) async throws {
+        struct ClimateBody: Codable {
+            let on: Bool
+            let temp_c: Double?
+        }
+        let body = ClimateBody(on: on, temp_c: tempC)
+        let bodyData = try JSONEncoder().encode(body)
+        let req = request(path: "/vehicles/\(vehicleId)/command/climate", method: "POST", body: bodyData)
+        let (data, resp) = try await Self.session.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            let msg = String(data: data, encoding: .utf8) ?? "Climate command failed"
+            throw TeslaError.commandFailed(msg)
+        }
+    }
+
+    // MARK: - Optimize Stop Order
+
+    func optimizeStopOrder(_ stops: [RouteStop], origin: String?) async throws -> [RouteStop] {
+        struct OptBody: Codable { let origin: String?; let stops: [RouteStop] }
+        let body = OptBody(origin: origin, stops: stops)
+        let bodyData = try JSONEncoder().encode(body)
+        let req = request(path: "/route/optimize-order", method: "POST", body: bodyData)
+        let (data, _) = try await Self.session.data(for: req)
+        struct OptResponse: Codable { let stops: [RouteStop] }
+        let result = try JSONDecoder().decode(OptResponse.self, from: data)
+        return result.stops
     }
 
     // MARK: - Resolve Route (Places + Directions + Preferences)
@@ -109,9 +169,11 @@ class TeslaService: ObservableObject {
 
         struct DirectionsInfo: Codable {
             let totalDurationMin: Int?
+            let totalDistanceKm: Double?
 
             enum CodingKeys: String, CodingKey {
                 case totalDurationMin = "total_duration_min"
+                case totalDistanceKm = "total_distance_km"
             }
         }
         struct RouteResponse: Codable {
@@ -122,7 +184,8 @@ class TeslaService: ObservableObject {
         let result = try JSONDecoder().decode(RouteResponse.self, from: data)
         return ResolvedRoute(
             stops: result.stops,
-            totalDriveMin: result.directions?.totalDurationMin
+            totalDriveMin: result.directions?.totalDurationMin,
+            totalDistanceKm: result.directions?.totalDistanceKm
         )
     }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-class LLMService {
+final class LLMService: Sendable {
     private let baseURL = "https://api.anthropic.com/v1/messages"
 
     static let systemPrompt = """
@@ -51,6 +51,13 @@ class LLMService {
     - "avoid the freeway" → avoidHighways: true
     - Any other route context → put in preferenceNotes
 
+    Saved places:
+    - The user may have saved locations (Home, Work, favorites). These will be provided below.
+    - When the user says "home", "my house", "take me home" → use their saved Home address.
+    - When the user says "work", "the office", "go to work" → use their saved Work address.
+    - When the user mentions a saved favorite by name → use that saved address.
+    - For saved places, set stopType to "specific" and use the saved address.
+
     Rules:
     - Preserve the user's intended stop order
     - Make addresses as complete as possible (city, state, ZIP when inferrable)
@@ -60,13 +67,37 @@ class LLMService {
     - If nothing found: {"origin": null, "stops": [], "preferences": null, "notes": "No destinations found"}
     """
 
-    func parsePrompt(_ prompt: String, apiKey: String) async throws -> ParsedRoute {
+    func parsePrompt(
+        _ prompt: String,
+        apiKey: String,
+        savedLocations: [(name: String, address: String)] = [],
+        calendarEvents: [CalendarEvent] = [],
+        contactAddresses: [ContactAddress] = []
+    ) async throws -> ParsedRoute {
         guard !apiKey.isEmpty else { throw LLMError.noApiKey }
+
+        var system = LLMService.systemPrompt
+        if !savedLocations.isEmpty {
+            let places = savedLocations.map { "\($0.name): \($0.address)" }.joined(separator: "\n")
+            system += "\n\nUser's saved places:\n\(places)"
+        }
+
+        if !calendarEvents.isEmpty {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "EEE h:mm a"
+            let events = calendarEvents.prefix(5).map { "\($0.title) at \(formatter.string(from: $0.startDate)): \($0.location)" }.joined(separator: "\n")
+            system += "\n\nUpcoming calendar events (use these locations when user mentions events like \"my meeting\", \"dentist\", \"appointment\", etc.):\n\(events)"
+        }
+
+        if !contactAddresses.isEmpty {
+            let contacts = contactAddresses.prefix(10).map { "\($0.name): \($0.address)" }.joined(separator: "\n")
+            system += "\n\nUser's contacts with addresses (use when user mentions a person's name):\n\(contacts)"
+        }
 
         let request = ClaudeRequest(
             model: "claude-haiku-4-5-20251001",
             maxTokens: 1024,
-            system: LLMService.systemPrompt,
+            system: system,
             messages: [ClaudeMessage(role: "user", content: prompt)]
         )
 

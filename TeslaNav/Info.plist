@@ -18,9 +18,43 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>teslanav</string>
+			</array>
+			<key>CFBundleURLName</key>
+			<string>com.alexlifshitz.TeslaNav</string>
+		</dict>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>AccentColor</string>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>TeslaNav needs microphone access to listen to your voice commands for navigation.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>TeslaNav uses speech recognition to convert your voice commands into navigation instructions.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>TeslaNav reads your calendar to suggest upcoming event locations for navigation.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>TeslaNav reads your calendar to suggest upcoming event locations for navigation.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>TeslaNav accesses your contacts to help navigate to people's addresses.</string>
 </dict>
 </plist>

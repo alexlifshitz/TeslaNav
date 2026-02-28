@@ -3,53 +3,90 @@ import SwiftUI
 // MARK: - Main View
 
 struct ContentView: View {
+    @EnvironmentObject var deepLink: DeepLinkManager
     @StateObject private var speech = SpeechService()
     @StateObject private var tesla = TeslaService()
     @StateObject private var vm = RouteViewModel()
+    @StateObject private var calendar = CalendarService()
+    @StateObject private var contacts = ContactsService()
+    @StateObject private var weather = WeatherService()
     @State private var showSettings = false
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                Color.black.ignoresSafeArea()
-
-                ScrollView {
-                    VStack(spacing: 0) {
-                        VoiceInputCard(speech: speech, vm: vm)
-
-                        if !vm.stops.isEmpty {
-                            RouteStopsSection(vm: vm)
-                        }
-
-                        if !vm.stops.isEmpty && !vm.isOptimizing {
-                            VehicleSendSection(tesla: tesla, vm: vm)
-                        }
-
-                        Spacer(minLength: 40)
-                    }
-                    .padding(.horizontal, 16)
+            mainContent
+                .navigationBarHidden(true)
+                .sheet(isPresented: $showSettings) { SettingsView(tesla: tesla) }
+                .task { [tesla] in await tesla.loadVehicles() }
+                .task { [calendar] in
+                    if AppSettings.current.calendarEnabled { await calendar.requestAccess() }
                 }
-            }
-            .navigationTitle("Tesla Nav")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button(action: { showSettings = true }) {
-                        Image(systemName: "gear")
-                            .foregroundColor(.white)
+                .task { [contacts] in
+                    if AppSettings.current.contactsEnabled { await contacts.requestAccess() }
+                }
+                .task { [weather] in
+                    await weather.fetchWeather(latitude: 37.7749, longitude: -122.4194)
+                }
+                .onChange(of: vm.stops) { _, _ in vm.checkBatteryRange(tesla: tesla) }
+                .onChange(of: vm.selectedVehicleIds) { _, _ in vm.checkBatteryRange(tesla: tesla) }
+                .onChange(of: speech.transcript) { _, new in vm.promptText = new }
+                .onChange(of: deepLink.shouldOpenSettings) { _, open in
+                    if open { showSettings = true; deepLink.shouldOpenSettings = false }
+                }
+                .onChange(of: deepLink.pendingPrompt) { _, prompt in
+                    if let prompt {
+                        vm.promptText = prompt
+                        deepLink.pendingPrompt = nil
+                        Task { await vm.parseAndOptimize(calendarEvents: calendar.upcomingEvents, contactAddresses: contacts.recentAddresses) }
                     }
                 }
-                ToolbarItem(placement: .topBarLeading) {
-                    ConnectionBadge(tesla: tesla)
+        }
+    }
+
+    private var mainContent: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+                .onTapGesture {
+                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                 }
+
+            ScrollView {
+                VStack(spacing: 16) {
+                    headerRow
+                    VoiceInputCard(speech: speech, vm: vm, calendar: calendar, contacts: contacts)
+                    routeActionsSection
+                    VehicleSendSection(tesla: tesla, vm: vm, weather: weather)
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 40)
             }
-            .sheet(isPresented: $showSettings) {
-                SettingsView(tesla: tesla)
+            .scrollDismissesKeyboard(.immediately)
+        }
+    }
+
+    private var headerRow: some View {
+        HStack {
+            Text("Tesla Nav")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundColor(.white)
+            Spacer()
+            Button(action: { showSettings = true }) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 18))
+                    .foregroundColor(.gray)
+                    .frame(width: 36, height: 36)
+                    .background(Color(white: 0.12))
+                    .clipShape(Circle())
             }
-            .task { await tesla.loadVehicles() }
-            .onChange(of: speech.transcript) { _, new in
-                vm.promptText = new
-            }
+        }
+        .padding(.top, 8)
+    }
+
+    @ViewBuilder
+    private var routeActionsSection: some View {
+        if !vm.stops.isEmpty {
+            RouteStopsSection(vm: vm, tesla: tesla)
+            RouteActionsBar(vm: vm, tesla: tesla)
         }
     }
 }
@@ -59,67 +96,132 @@ struct ContentView: View {
 struct VoiceInputCard: View {
     @ObservedObject var speech: SpeechService
     @ObservedObject var vm: RouteViewModel
+    @ObservedObject var calendar: CalendarService
+    @ObservedObject var contacts: ContactsService
 
     var body: some View {
-        VStack(spacing: 16) {
-            Button(action: { speech.startListening() }) {
-                ZStack {
-                    Circle()
-                        .fill(speech.isListening
-                              ? Color.red.opacity(0.2)
-                              : Color(white: 0.12))
-                        .frame(width: 80, height: 80)
-                        .overlay(
-                            Circle().stroke(
-                                speech.isListening ? Color.red : Color(white: 0.2),
-                                lineWidth: 1.5
+        VStack(spacing: 14) {
+            // Mic + text input side by side
+            HStack(alignment: .top, spacing: 12) {
+                // Mic button
+                Button(action: { speech.startListening() }) {
+                    ZStack {
+                        Circle()
+                            .fill(speech.isListening
+                                  ? Color.red.opacity(0.2)
+                                  : Color(white: 0.12))
+                            .frame(width: 56, height: 56)
+                            .overlay(
+                                Circle().stroke(
+                                    speech.isListening ? Color.red : Color(white: 0.25),
+                                    lineWidth: 1.5
+                                )
                             )
+
+                        if speech.isListening {
+                            WaveformView()
+                                .frame(width: 28, height: 18)
+                                .foregroundColor(.red)
+                        } else {
+                            Image(systemName: "mic.fill")
+                                .font(.system(size: 22))
+                                .foregroundColor(.white)
+                        }
+                    }
+                }
+                .padding(.top, 4)
+
+                // Text input
+                ZStack(alignment: .topLeading) {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color(white: 0.08))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color(white: 0.18), lineWidth: 1)
                         )
 
-                    if speech.isListening {
-                        WaveformView()
-                            .frame(width: 36, height: 24)
-                            .foregroundColor(.red)
-                    } else {
-                        Image(systemName: "mic.fill")
-                            .font(.system(size: 28))
-                            .foregroundColor(.white)
+                    if vm.promptText.isEmpty {
+                        Text("\"Take me to Costco, stop at Starbucks on the way, scenic route\"")
+                            .font(.system(size: 14))
+                            .foregroundColor(.gray.opacity(0.4))
+                            .padding(12)
+                    }
+
+                    TextEditor(text: $vm.promptText)
+                        .font(.system(size: 14))
+                        .foregroundColor(.white)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .frame(minHeight: 80)
+                }
+                .frame(minHeight: 80)
+            }
+
+            // Quick-tap saved locations
+            let saved = AppSettings.current.allSavedLocations
+            if !saved.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(saved, id: \.name) { loc in
+                            Button(action: {
+                                vm.promptText = vm.promptText.isEmpty
+                                    ? "Take me to \(loc.name)"
+                                    : "\(vm.promptText), stop at \(loc.name)"
+                            }) {
+                                Label(loc.name, systemImage: loc.icon)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(.yellow)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
+                                    .background(Color.yellow.opacity(0.1))
+                                    .clipShape(Capsule())
+                                    .overlay(Capsule().stroke(Color.yellow.opacity(0.3), lineWidth: 1))
+                            }
+                        }
                     }
                 }
             }
-            .padding(.top, 24)
 
-            Text(speech.isListening ? "Listening..." : "Tap to speak or type below")
-                .font(.system(size: 13, weight: .medium, design: .monospaced))
-                .foregroundColor(.gray)
-
-            ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(white: 0.08))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color(white: 0.15), lineWidth: 1)
-                    )
-
-                if vm.promptText.isEmpty {
-                    Text("\"Costco, then dry cleaning on University Ave, then home\"")
-                        .font(.system(size: 14))
-                        .foregroundColor(.gray.opacity(0.5))
-                        .padding(14)
+            // Calendar event chips
+            if !calendar.upcomingEvents.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(calendar.upcomingEvents.prefix(3)) { event in
+                            Button(action: {
+                                vm.promptText = vm.promptText.isEmpty
+                                    ? "Take me to \(event.title)"
+                                    : "\(vm.promptText), then to \(event.title)"
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "calendar")
+                                        .font(.system(size: 10))
+                                    Text(event.title)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .lineLimit(1)
+                                }
+                                .foregroundColor(.cyan)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Color.cyan.opacity(0.1))
+                                .clipShape(Capsule())
+                                .overlay(Capsule().stroke(Color.cyan.opacity(0.3), lineWidth: 1))
+                            }
+                        }
+                    }
                 }
-
-                TextEditor(text: $vm.promptText)
-                    .font(.system(size: 14))
-                    .foregroundColor(.white)
-                    .scrollContentBackground(.hidden)
-                    .padding(10)
-                    .frame(minHeight: 90)
             }
-            .frame(minHeight: 90)
 
+            // Buttons row
             HStack(spacing: 10) {
-                // Build Route
-                Button(action: { Task { await vm.parseAndOptimize() } }) {
+                Button(action: {
+                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    Task {
+                        await vm.parseAndOptimize(
+                            calendarEvents: calendar.upcomingEvents,
+                            contactAddresses: contacts.recentAddresses
+                        )
+                    }
+                }) {
                     HStack(spacing: 8) {
                         if vm.isOptimizing {
                             ProgressView()
@@ -133,39 +235,80 @@ struct VoiceInputCard: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
-                    .background(vm.promptText.isEmpty ? Color(white: 0.15) : Color.yellow)
+                    .background(vm.promptText.isEmpty ? Color(white: 0.12) : Color.yellow)
                     .foregroundColor(vm.promptText.isEmpty ? .gray : .black)
                     .cornerRadius(12)
                 }
                 .disabled(vm.promptText.isEmpty || vm.isOptimizing)
 
-                // Clear
-                if !vm.stops.isEmpty {
-                    Button(action: { vm.clearRoute() }) {
+                if !vm.stops.isEmpty || !vm.promptText.isEmpty {
+                    Button(action: {
+                        vm.clearRoute()
+                        vm.promptText = ""
+                    }) {
                         Image(systemName: "xmark")
-                            .fontWeight(.bold)
+                            .fontWeight(.semibold)
                             .frame(width: 48, height: 48)
                             .background(Color(white: 0.12))
                             .foregroundColor(.gray)
                             .cornerRadius(12)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color(white: 0.15), lineWidth: 1)
-                            )
                     }
                 }
             }
 
             if let err = vm.errorMessage {
                 Label(err, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: 12))
                     .foregroundColor(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
                     .background(Color.red.opacity(0.1))
                     .cornerRadius(8)
             }
         }
-        .padding(.bottom, 8)
+        .padding(.top, 8)
+    }
+}
+
+// MARK: - Route Actions Bar
+
+struct RouteActionsBar: View {
+    @ObservedObject var vm: RouteViewModel
+    @ObservedObject var tesla: TeslaService
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if vm.stops.count >= 3 {
+                Button(action: { Task { await vm.optimizeOrder(tesla: tesla) } }) {
+                    HStack(spacing: 8) {
+                        if vm.isResolving {
+                            ProgressView().tint(.yellow).scaleEffect(0.8)
+                        } else {
+                            Image(systemName: "arrow.triangle.swap")
+                        }
+                        Text("Optimize Route Order")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.yellow.opacity(0.12))
+                    .foregroundColor(.yellow)
+                    .cornerRadius(10)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.yellow.opacity(0.3)))
+                }
+                .disabled(vm.isResolving)
+            }
+
+            if let warning = vm.rangeWarning {
+                Label(warning, systemImage: "battery.25")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.orange)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.1))
+                    .cornerRadius(8)
+            }
+        }
     }
 }
 
@@ -173,28 +316,46 @@ struct VoiceInputCard: View {
 
 struct RouteStopsSection: View {
     @ObservedObject var vm: RouteViewModel
+    @ObservedObject var tesla: TeslaService
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Route header with total drive time
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
-                SectionHeader(title: "Route", badge: "\(vm.stops.count) stop\(vm.stops.count == 1 ? "" : "s")")
-                if let total = vm.totalDriveMin {
-                    Text("\(total) min total")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(Color(red: 0.3, green: 0.8, blue: 1))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Color(red: 0.3, green: 0.8, blue: 1).opacity(0.1))
-                        .clipShape(Capsule())
+                Text("ROUTE")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.gray)
+                    .tracking(1.5)
+
+                Spacer()
+
+                Text("\(vm.stops.count) stop\(vm.stops.count == 1 ? "" : "s")")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.gray)
+
+                if vm.isResolving {
+                    HStack(spacing: 4) {
+                        ProgressView().scaleEffect(0.6).tint(.yellow)
+                        Text("Resolving...")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.yellow)
+                    }
+                } else {
+                    if let dist = vm.totalDistanceKm {
+                        let miles = dist * 0.621371
+                        Text(String(format: "%.0f mi", miles))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.yellow)
+                    }
+                    if let total = vm.totalDriveMin {
+                        Text("\(total) min")
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(Color(red: 0.3, green: 0.8, blue: 1))
+                    }
                 }
             }
-            .padding(.vertical, 16)
 
-            // Route preferences badges
             if let prefs = vm.preferences {
                 RoutePrefsBadges(prefs: prefs)
-                    .padding(.bottom, 10)
             }
 
             VStack(spacing: 0) {
@@ -202,7 +363,7 @@ struct RouteStopsSection: View {
                     RouteStopRow(stop: stop, index: idx, isLast: idx == vm.stops.count - 1)
                 }
             }
-            .background(Color(white: 0.07))
+            .background(Color(white: 0.06))
             .clipShape(RoundedRectangle(cornerRadius: 14))
             .overlay(
                 RoundedRectangle(cornerRadius: 14)
@@ -250,18 +411,24 @@ struct RouteStopRow: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let drive = stop.driveMinutesFromPrev {
+            if stop.driveMinutesFromPrev != nil || stop.distanceMeters != nil {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.down")
                         .font(.system(size: 9))
-                    Text("\(drive) min")
+                    if let drive = stop.driveMinutesFromPrev {
+                        Text("\(drive) min")
+                    }
+                    if let dist = stop.distanceMeters {
+                        let miles = Double(dist) / 1609.34
+                        Text(String(format: "%.1f mi", miles))
+                    }
                     Spacer()
                 }
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.gray)
                 .padding(.horizontal, 16)
-                .padding(.vertical, 6)
-                .background(Color(white: 0.05))
+                .padding(.vertical, 5)
+                .background(Color(white: 0.04))
             }
 
             HStack(alignment: .top, spacing: 12) {
@@ -276,10 +443,9 @@ struct RouteStopRow: View {
                         .font(.system(size: 13, weight: .bold, design: .monospaced))
                         .foregroundColor(stop.hasConflict ? .red : .yellow)
                 }
-                .frame(width: 30, height: 30)
+                .frame(width: 28, height: 28)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    // Label + address
+                VStack(alignment: .leading, spacing: 3) {
                     if let label = stop.label, !label.isEmpty {
                         HStack(spacing: 6) {
                             Text(label)
@@ -296,7 +462,7 @@ struct RouteStopRow: View {
                             }
                         }
                         Text(stop.address)
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.system(size: 11))
                             .foregroundColor(.gray)
                     } else {
                         Text(stop.address)
@@ -313,7 +479,7 @@ struct RouteStopRow: View {
                     if let notes = stop.notes, !notes.isEmpty {
                         Text(notes)
                             .font(.system(size: 11))
-                            .foregroundColor(.gray.opacity(0.8))
+                            .foregroundColor(.gray.opacity(0.7))
                             .italic()
                     }
 
@@ -332,12 +498,12 @@ struct RouteStopRow: View {
 
                 Spacer()
             }
-            .padding(14)
+            .padding(12)
 
             if !isLast {
                 Divider()
                     .background(Color(white: 0.13))
-                    .padding(.leading, 56)
+                    .padding(.leading, 52)
             }
         }
     }
@@ -348,36 +514,70 @@ struct RouteStopRow: View {
 struct VehicleSendSection: View {
     @ObservedObject var tesla: TeslaService
     @ObservedObject var vm: RouteViewModel
+    @ObservedObject var weather: WeatherService
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SectionHeader(title: "Send to Tesla", badge: tesla.vehicles.isEmpty ? "No cars" : "\(tesla.vehicles.count) car\(tesla.vehicles.count == 1 ? "" : "s")")
-                .padding(.vertical, 16)
-
-            if tesla.vehicles.isEmpty {
-                HStack {
-                    Image(systemName: "car.fill")
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("YOUR TESLAS")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.gray)
+                    .tracking(1.5)
+                Spacer()
+                if !tesla.vehicles.isEmpty {
+                    Text("\(tesla.vehicles.count) car\(tesla.vehicles.count == 1 ? "" : "s")")
+                        .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.gray)
-                    Text("Add Tesla token in Settings to load vehicles")
+                }
+            }
+
+            if tesla.isLoading {
+                HStack {
+                    ProgressView().tint(.gray).scaleEffect(0.8)
+                    Text("Loading vehicles...")
                         .font(.system(size: 13))
                         .foregroundColor(.gray)
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(white: 0.07))
+                .background(Color(white: 0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(white: 0.13)))
+
+            } else if tesla.vehicles.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "car.fill")
+                            .font(.system(size: 18))
+                            .foregroundColor(.gray)
+                        Text("No vehicles found")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                    Text("Add your Tesla token in Settings to connect your cars.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.gray)
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(white: 0.06))
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(white: 0.13)))
 
             } else {
-                VStack(spacing: 10) {
+                VStack(spacing: 8) {
                     ForEach(tesla.vehicles) { vehicle in
                         VehicleToggleRow(
                             vehicle: vehicle,
                             isSelected: vm.selectedVehicleIds.contains(vehicle.id),
+                            status: tesla.vehicleStatus[vehicle.id],
                             onToggle: { vm.toggleVehicle(vehicle.id) }
                         )
                     }
+                }
 
+                // Send button — only show when there's a route
+                if !vm.stops.isEmpty {
                     Button(action: { Task { await vm.sendToSelectedVehicles(tesla: tesla) } }) {
                         HStack(spacing: 8) {
                             if vm.isSending {
@@ -390,37 +590,78 @@ struct VehicleSendSection: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
-                        .background(vm.selectedVehicleIds.isEmpty ? Color(white: 0.15) : Color(red: 0.28, green: 0.78, blue: 1))
-                        .foregroundColor(vm.selectedVehicleIds.isEmpty ? .gray : .black)
+                        .background(canSend ? Color(red: 0.28, green: 0.78, blue: 1) : Color(white: 0.1))
+                        .foregroundColor(canSend ? .black : .gray)
                         .cornerRadius(12)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(canSend ? Color.clear : Color(white: 0.15), lineWidth: 1)
+                        )
                     }
-                    .disabled(vm.selectedVehicleIds.isEmpty || vm.isSending)
+                    .disabled(!canSend)
+                }
 
-                    ForEach(Array(vm.sendStatus.keys.sorted()), id: \.self) { key in
-                        if let status = vm.sendStatus[key] {
-                            HStack {
-                                Image(systemName: status.success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                    .foregroundColor(status.success ? .green : .red)
-                                Text(status.message)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundColor(.gray)
-                                Spacer()
+                // Pre-condition climate
+                if !vm.selectedVehicleIds.isEmpty {
+                    Button(action: { Task { await vm.activateClimate(tesla: tesla, weather: weather) } }) {
+                        HStack(spacing: 8) {
+                            if vm.isClimateActivating {
+                                ProgressView().tint(.cyan).scaleEffect(0.8)
+                            } else {
+                                Image(systemName: "snowflake")
                             }
-                            .padding(10)
-                            .background(Color(white: 0.07))
-                            .cornerRadius(8)
+                            Text(vm.isClimateActivating ? "Starting..." : "Pre-condition Climate")
+                                .font(.system(size: 13, weight: .semibold))
                         }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.cyan.opacity(0.12))
+                        .foregroundColor(.cyan)
+                        .cornerRadius(10)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cyan.opacity(0.3)))
+                    }
+                    .disabled(vm.isClimateActivating)
+                }
+
+                // Climate status
+                if let climateMsg = vm.climateStatus {
+                    Label(climateMsg, systemImage: "thermometer.medium")
+                        .font(.system(size: 12))
+                        .foregroundColor(.cyan)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.cyan.opacity(0.08))
+                        .cornerRadius(8)
+                }
+
+                // Send results
+                ForEach(vm.sendStatus.keys.sorted(), id: \.self) { key in
+                    if let status = vm.sendStatus[key] {
+                        HStack {
+                            Image(systemName: status.success ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundColor(status.success ? .green : .red)
+                            Text(status.message)
+                                .font(.system(size: 12))
+                                .foregroundColor(.gray)
+                            Spacer()
+                        }
+                        .padding(10)
+                        .background(Color(white: 0.06))
+                        .cornerRadius(8)
                     }
                 }
             }
         }
-        .padding(.bottom, 16)
+    }
+
+    private var canSend: Bool {
+        !vm.selectedVehicleIds.isEmpty && !vm.stops.isEmpty && !vm.isSending
     }
 
     private var sendButtonLabel: String {
         if vm.isSending { return "Sending..." }
         let count = vm.selectedVehicleIds.count
-        if count == 0 { return "Select a car" }
+        if count == 0 { return "Select a car above" }
         return "Send to \(count) Car\(count == 1 ? "" : "s")"
     }
 }
@@ -428,94 +669,80 @@ struct VehicleSendSection: View {
 struct VehicleToggleRow: View {
     let vehicle: TeslaVehicle
     let isSelected: Bool
+    let status: VehicleStatusData?
     let onToggle: () -> Void
 
     var body: some View {
         Button(action: onToggle) {
             HStack(spacing: 12) {
                 Image(systemName: "car.side.fill")
-                    .font(.system(size: 20))
+                    .font(.system(size: 22))
                     .foregroundColor(isSelected ? .yellow : .gray)
-                    .frame(width: 32)
+                    .frame(width: 36)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(vehicle.displayName)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(.white)
-                    Text(vehicle.vin)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.gray)
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(vehicle.isOnline ? Color.green : Color.gray.opacity(0.5))
+                            .frame(width: 7, height: 7)
+                        Text(vehicle.state.capitalized)
+                            .font(.system(size: 11))
+                            .foregroundColor(.gray)
+
+                        if let s = status {
+                            Text("·")
+                                .foregroundColor(.gray)
+                            Image(systemName: batteryIcon(s.batteryLevel))
+                                .font(.system(size: 10))
+                                .foregroundColor(batteryColor(s.batteryLevel))
+                            Text("\(s.batteryLevel)%")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(batteryColor(s.batteryLevel))
+                            Text("\(Int(s.batteryRange)) mi")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.gray)
+                        }
+                    }
                 }
 
                 Spacer()
 
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(vehicle.isOnline ? Color.green : Color.gray)
-                        .frame(width: 6, height: 6)
-                    Text(vehicle.state.capitalized)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.gray)
+                if let s = status, s.isClimateOn {
+                    Image(systemName: "snowflake")
+                        .font(.system(size: 12))
+                        .foregroundColor(.cyan)
                 }
 
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundColor(isSelected ? .yellow : Color(white: 0.3))
-                    .font(.system(size: 20))
+                    .foregroundColor(isSelected ? .yellow : Color(white: 0.25))
+                    .font(.system(size: 24))
             }
-            .padding(14)
-            .background(Color(white: isSelected ? 0.1 : 0.07))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(Color(white: isSelected ? 0.1 : 0.06))
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .overlay(
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(isSelected ? Color.yellow.opacity(0.4) : Color(white: 0.13), lineWidth: 1)
+                    .stroke(isSelected ? Color.yellow.opacity(0.5) : Color(white: 0.13), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
     }
-}
 
-// MARK: - Helpers
-
-struct SectionHeader: View {
-    let title: String
-    let badge: String
-
-    var body: some View {
-        HStack {
-            Text(title.uppercased())
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundColor(.gray)
-                .tracking(1.5)
-            Spacer()
-            Text(badge)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(.gray)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Color(white: 0.1))
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(Color(white: 0.15), lineWidth: 1))
-        }
+    private func batteryIcon(_ level: Int) -> String {
+        if level > 75 { return "battery.100" }
+        if level > 50 { return "battery.75" }
+        if level > 25 { return "battery.50" }
+        return "battery.25"
     }
-}
 
-struct ConnectionBadge: View {
-    @ObservedObject var tesla: TeslaService
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(tesla.vehicles.isEmpty ? Color.gray : Color.green)
-                .frame(width: 7, height: 7)
-            Text(tesla.vehicles.isEmpty ? "NO CAR" : "\(tesla.vehicles.count) CAR\(tesla.vehicles.count == 1 ? "" : "S")")
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.gray)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(Color(white: 0.1))
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(Color(white: 0.15), lineWidth: 1))
+    private func batteryColor(_ level: Int) -> Color {
+        if level > 50 { return .green }
+        if level > 20 { return .yellow }
+        return .red
     }
 }
 

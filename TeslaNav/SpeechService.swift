@@ -1,7 +1,6 @@
 import Foundation
 import Speech
 import AVFoundation
-import Combine
 
 @MainActor
 class SpeechService: NSObject, ObservableObject {
@@ -15,7 +14,9 @@ class SpeechService: NSObject, ObservableObject {
     private var recognitionTask: SFSpeechRecognitionTask?
     private let audioEngine = AVAudioEngine()
     private var silenceTimer: Timer?
+    private var maxTimer: Timer?
     private let silenceTimeout: TimeInterval = 2.0
+    private let maxDuration: TimeInterval = 30.0
 
     override init() {
         super.init()
@@ -26,7 +27,7 @@ class SpeechService: NSObject, ObservableObject {
 
     private func requestPermissions() {
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
-            DispatchQueue.main.async {
+            Task { @MainActor [weak self] in
                 self?.isAvailable = status == .authorized
                 if status != .authorized {
                     self?.error = "Speech recognition not authorized"
@@ -46,22 +47,40 @@ class SpeechService: NSObject, ObservableObject {
             try startAudioSession()
             try startRecognition()
             isListening = true
+
+            // Safety: auto-stop after max duration
+            maxTimer = Timer.scheduledTimer(withTimeInterval: maxDuration, repeats: false) { _ in
+                Task { @MainActor [weak self] in
+                    self?.stopListening()
+                }
+            }
         } catch {
             self.error = error.localizedDescription
+            cleanup()
         }
     }
 
     func stopListening() {
+        guard isListening else { return }
+        isListening = false
+        cleanup()
+    }
+
+    private func cleanup() {
         silenceTimer?.invalidate()
         silenceTimer = nil
+        maxTimer?.invalidate()
+        maxTimer = nil
+
         audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
 
         try? AVAudioSession.sharedInstance().setActive(false)
-        isListening = false
     }
 
     private func startAudioSession() throws {
@@ -87,23 +106,29 @@ class SpeechService: NSObject, ObservableObject {
         try audioEngine.start()
 
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
-            if let result {
-                DispatchQueue.main.async {
-                    self?.transcript = result.bestTranscription.formattedString
-                    self?.resetSilenceTimer()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                if let result {
+                    self.transcript = result.bestTranscription.formattedString
+                    self.resetSilenceTimer()
+
+                    if result.isFinal {
+                        self.stopListening()
+                    }
                 }
-            }
-            if error != nil || (result?.isFinal ?? false) {
-                DispatchQueue.main.async { self?.stopListening() }
+
+                if error != nil, self.isListening {
+                    self.stopListening()
+                }
             }
         }
     }
 
-    /// Auto-stop after silence — commits faster so user doesn't wait
     private func resetSilenceTimer() {
         silenceTimer?.invalidate()
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: silenceTimeout, repeats: false) { [weak self] _ in
-            DispatchQueue.main.async {
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: silenceTimeout, repeats: false) { _ in
+            Task { @MainActor [weak self] in
                 guard let self, self.isListening, !self.transcript.isEmpty else { return }
                 self.stopListening()
             }
