@@ -1990,8 +1990,15 @@ async def generate_report(
     with open(os.path.join(report_dir, "index.html"), "w") as f:
         f.write(html)
 
-    # Build URL
-    base_url = str(request.base_url).rstrip("/")
+    # Build URL — prefer X-Forwarded-Host (ngrok) or Origin header over localhost
+    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    forwarded_proto = request.headers.get("x-forwarded-proto", "https" if request.headers.get("x-forwarded-host") else "http")
+    if forwarded_host and "localhost" not in forwarded_host:
+        base_url = f"{forwarded_proto}://{forwarded_host}"
+    else:
+        # Fall back to Origin header from client (the ngrok URL the app uses)
+        origin = request.headers.get("origin", "").rstrip("/")
+        base_url = origin if origin else str(request.base_url).rstrip("/")
     report_url = f"{base_url}/report-media/{report_id}/index.html"
 
     return {"url": report_url, "reportId": report_id}
