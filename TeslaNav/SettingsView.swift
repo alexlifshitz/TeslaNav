@@ -102,6 +102,7 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         sectionHeader("TESLA")
                         apiField("Tesla access token", text: $settings.teslaAccessToken)
+                        apiField("Tesla refresh token", text: $settings.teslaRefreshToken)
 
                         if !settings.backendUrl.isEmpty {
                             Link(destination: URL(string: "\(settings.backendUrl)/tesla/auth")!) {

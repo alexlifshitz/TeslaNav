@@ -286,6 +286,7 @@ struct AppSettings: Codable {
     var claudeApiKey: String = ""
     var googleMapsApiKey: String = ""
     var teslaAccessToken: String = ""
+    var teslaRefreshToken: String = ""
     var backendUrl: String = "http://localhost:8000"
     var defaultDwellMinutes: Int = 20
     var trafficModel: String = "best_guess"
@@ -303,6 +304,7 @@ struct AppSettings: Codable {
         claudeApiKey = (try? c.decode(String.self, forKey: .claudeApiKey)) ?? ""
         googleMapsApiKey = (try? c.decode(String.self, forKey: .googleMapsApiKey)) ?? ""
         teslaAccessToken = (try? c.decode(String.self, forKey: .teslaAccessToken)) ?? ""
+        teslaRefreshToken = (try? c.decode(String.self, forKey: .teslaRefreshToken)) ?? ""
         backendUrl = (try? c.decode(String.self, forKey: .backendUrl)) ?? "http://localhost:8000"
         defaultDwellMinutes = (try? c.decode(Int.self, forKey: .defaultDwellMinutes)) ?? 20
         trafficModel = (try? c.decode(String.self, forKey: .trafficModel)) ?? "best_guess"

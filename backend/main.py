@@ -6,7 +6,7 @@ Install: pip install fastapi uvicorn httpx python-dotenv
 Run:     uvicorn main:app --reload --port 8000
 """
 
-import os, re, json, time, asyncio, urllib.parse, logging, traceback
+import os, re, json, time, asyncio, urllib.parse, logging, traceback, csv, io, math
 from typing import Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -48,6 +48,66 @@ TESLA_REDIRECT_URI = os.getenv("TESLA_REDIRECT_URI", "http://localhost:8000/tesl
 
 # Shared HTTP client for connection reuse
 http = httpx.AsyncClient(timeout=15)
+
+
+# ─── TOKEN REFRESH HELPER ─────────────────────────────────────────────────
+
+async def refresh_tesla_token(refresh_token: str) -> Optional[dict]:
+    """Exchange a refresh token for a new access + refresh token pair."""
+    if not TESLA_CLIENT_ID or not refresh_token:
+        return None
+    try:
+        r = await http.post(
+            f"{TESLA_AUTH_BASE}/token",
+            data={
+                "grant_type": "refresh_token",
+                "client_id": TESLA_CLIENT_ID,
+                "refresh_token": refresh_token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if r.status_code == 200:
+            tokens = r.json()
+            logger.info("Token refreshed successfully")
+            return tokens
+        logger.error(f"Token refresh failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"Token refresh error: {e}")
+    return None
+
+
+async def tesla_request(
+    method: str,
+    path: str,
+    authorization: str,
+    refresh_token: str = "",
+    **kwargs,
+) -> tuple:
+    """
+    Make a Tesla API request with automatic token refresh on 401.
+    Returns (httpx.Response, new_tokens_dict_or_None).
+    """
+    headers = {"Authorization": authorization, **kwargs.pop("headers", {})}
+    r = await http.request(method, f"{TESLA_BASE}{path}", headers=headers, **kwargs)
+
+    if r.status_code == 401 and refresh_token:
+        logger.info(f"Got 401 on {path}, attempting token refresh")
+        tokens = await refresh_tesla_token(refresh_token)
+        if tokens and tokens.get("access_token"):
+            new_auth = f"Bearer {tokens['access_token']}"
+            headers["Authorization"] = new_auth
+            r = await http.request(method, f"{TESLA_BASE}{path}", headers=headers, **kwargs)
+            return r, tokens
+
+    return r, None
+
+
+def add_token_headers(response, tokens: Optional[dict]):
+    """Add refreshed token headers to the response if tokens were refreshed."""
+    if tokens:
+        response.headers["X-New-Access-Token"] = tokens.get("access_token", "")
+        if tokens.get("refresh_token"):
+            response.headers["X-New-Refresh-Token"] = tokens["refresh_token"]
 
 
 # ─── MODELS ──────────────────────────────────────────────────────────────────
@@ -110,6 +170,38 @@ REDFIN_HEADERS = {
     "Referer": "https://www.redfin.com/",
 }
 
+def lat_lng_to_poly(lat: float, lng: float, radius_miles: float) -> str:
+    """Return a closed polygon string (5 points: SW, NW, NE, SE, SW) for Redfin poly param."""
+    lat_deg = radius_miles / 69.0
+    lng_deg = radius_miles / (69.0 * math.cos(math.radians(lat)))
+    sw_lat, sw_lng = lat - lat_deg, lng - lng_deg
+    nw_lat, nw_lng = lat + lat_deg, lng - lng_deg
+    ne_lat, ne_lng = lat + lat_deg, lng + lng_deg
+    se_lat, se_lng = lat - lat_deg, lng + lng_deg
+    return f"{sw_lng} {sw_lat},{nw_lng} {nw_lat},{ne_lng} {ne_lat},{se_lng} {se_lat},{sw_lng} {sw_lat}"
+
+# Map Redfin CSV SOURCE values to dataSourceId for photo URLs
+REDFIN_SOURCE_TO_DSID = {
+    "MLSListings": 8,
+    "San Francisco MLS": 9,
+    "Bay East MLS": 6,
+    "MetroList MLS": 10,
+    "BAREIS MLS": 7,
+    "CRMLS": 1,
+    "CLAW MLS": 14,
+    "SDMLS": 5,
+    "TheMLS": 2,
+    "FMLS": 17,
+    "Bright MLS": 4,
+    "NWMLS": 3,
+    "RMLS": 11,
+    "ARMLS": 16,
+    "HAR": 15,
+    "Stellar MLS": 18,
+    "GAMLS": 19,
+    "Canopy MLS": 20,
+}
+
 REMODEL_KW = ["remodel", "renovated", "renovation", "updated kitchen", "updated bath",
               "newly updated", "fully updated", "move-in ready", "turn-key", "turnkey"]
 CONVERT_KW = ["office", "den", "bonus room", "family room", "flex room", "flex space"]
@@ -125,28 +217,48 @@ class SearchCriteria(BaseModel):
     minPrice: int = 1_500_000
     maxPrice: int = 2_900_000
     minBeds: int = 3
+    maxBeds: Optional[int] = None
+    minBaths: Optional[float] = None
     minSqft: int = 1750
+    maxSqft: Optional[int] = None
     bedroomsIdeal: int = 4
     sqftPreferred: int = 2000
     lotSqftMin: int = 5500
+    lotSqftMax: Optional[int] = None
     remodelPreference: str = "any"  # "must", "prefer", "any", "open_to_renovating"
     maxDaysOnMarket: Optional[int] = None  # None = no limit
     numPerCity: int = 10  # max listings per city
+    listingStatus: str = "for_sale"  # "for_sale", "recently_sold", "pending" — comma-separated for multi e.g. "recently_sold,pending"
+    soldWithinDays: int = 365  # only for recently_sold
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    radiusMiles: int = 50
 
 
 # ─── GOOGLE MAPS HELPERS ─────────────────────────────────────────────────────
 
 async def geocode(address: str, gkey: str) -> Optional[dict]:
-    """Geocode an address → {lat, lng}."""
-    if not gkey:
-        return None
-    r = await http.get(
-        "https://maps.googleapis.com/maps/api/geocode/json",
-        params={"address": address, "key": gkey},
-    )
-    data = r.json()
-    if data["status"] == "OK" and data["results"]:
-        return data["results"][0]["geometry"]["location"]
+    """Geocode an address → {lat, lng}. Uses Google Maps if key available, else Nominatim."""
+    if gkey:
+        r = await http.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": address, "key": gkey},
+        )
+        data = r.json()
+        if data["status"] == "OK" and data["results"]:
+            return data["results"][0]["geometry"]["location"]
+    # Fallback to Nominatim (free, no key needed)
+    try:
+        r = await http.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": address, "format": "json", "limit": 1, "countrycodes": "us"},
+            headers={"User-Agent": "OpenHouseApp/1.0"},
+        )
+        results = r.json()
+        if results:
+            return {"lat": float(results[0]["lat"]), "lng": float(results[0]["lon"])}
+    except Exception:
+        pass
     return None
 
 
@@ -428,16 +540,16 @@ async def optimize_route(body: RouteRequest):
 
 # ─── REDFIN LISTING HELPERS ──────────────────────────────────────────────────
 
-async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCriteria) -> list[dict]:
-    """Fetch listings from Redfin stingray GIS API for a single city."""
+async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCriteria, poly: str = None) -> list[dict]:
+    """Fetch active listings from Redfin stingray GIS JSON API for a single city.
+    Note: JSON endpoint ignores status param — only use for active/for_sale.
+    For sold/pending, use fetch_redfin_csv() instead."""
+
     params = {
         "al": 1,
-        "market": "sanfrancisco",
-        "num_homes": max(criteria.numPerCity * 2, 50),  # fetch extra to filter from
-        "ord": "days-on-redfin-asc",  # newest first
+        "num_homes": max(criteria.numPerCity * 2, 50),
+        "ord": "days-on-redfin-asc",
         "page_number": 1,
-        "region_id": city_info["region_id"],
-        "region_type": 6,
         "sf": "1,2,3,5,6,7",
         "status": 9,
         "uipt": 1,
@@ -447,6 +559,12 @@ async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCrit
         "num_beds": criteria.minBeds,
         "min_sqft": criteria.minSqft,
     }
+    if poly:
+        params["poly"] = poly
+    else:
+        params["market"] = "sanfrancisco"
+        params["region_id"] = city_info["region_id"]
+        params["region_type"] = 6
     try:
         r = await http.get(
             "https://www.redfin.com/stingray/api/gis",
@@ -569,8 +687,37 @@ async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCrit
                 continue
             if beds < criteria.minBeds:
                 continue
+            if criteria.maxBeds is not None and beds > criteria.maxBeds:
+                continue
+            if criteria.minBaths is not None and baths < criteria.minBaths:
+                continue
             if int(sqft) < criteria.minSqft and int(sqft) > 0:
                 continue
+            if criteria.maxSqft is not None and int(sqft) > criteria.maxSqft and int(sqft) > 0:
+                continue
+
+            # Extract sold price/date for recently sold listings
+            sold_price = None
+            sold_date = None
+            if criteria.listingStatus == "recently_sold":
+                sp_obj = h.get("soldPrice", h.get("price", {}))
+                if isinstance(sp_obj, dict):
+                    sold_price = int(sp_obj.get("value", 0) or 0) or None
+                elif sp_obj:
+                    sold_price = int(sp_obj) if sp_obj else None
+                sd_ts = h.get("soldDate") or h.get("saleDate")
+                if sd_ts:
+                    try:
+                        sold_date = datetime.fromtimestamp(int(sd_ts) / 1000).strftime("%Y-%m-%d")
+                    except Exception:
+                        sold_date = None
+                # For sold: use the original list price as "price"
+                lp_obj = h.get("listPrice", h.get("price", {}))
+                if isinstance(lp_obj, dict):
+                    list_price = int(lp_obj.get("value", price) or price)
+                else:
+                    list_price = int(lp_obj) if lp_obj else int(price)
+                price = list_price
 
             listing = {
                 "address": address,
@@ -591,26 +738,278 @@ async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCrit
                 "expandable": expandable,
                 "notes": notes,
                 "openHouses": open_houses if open_houses else None,
+                "soldPrice": sold_price,
+                "soldDate": sold_date,
+                "listingStatus": criteria.listingStatus,
             }
             listings.append(listing)
 
-        # Sort by days on market (newest first) and limit
-        listings.sort(key=lambda l: l["daysOnMarket"])
+        # Sort appropriately
+        if criteria.listingStatus == "recently_sold":
+            listings.sort(key=lambda l: l.get("soldDate") or "", reverse=True)
+        else:
+            listings.sort(key=lambda l: l["daysOnMarket"])
         return listings[:criteria.numPerCity]
     except Exception:
         return []
 
 
+async def fetch_redfin_csv(
+    criteria: SearchCriteria,
+    poly: str = None,
+    region_id: int = None,
+    city_name: str = "",
+    status_override: int = None,
+) -> list[dict]:
+    """Fetch listings via Redfin gis-csv endpoint. Correctly handles sold/pending status."""
+    status_map = {"for_sale": 9, "recently_sold": 130, "pending": 2}
+    redfin_status = status_override or status_map.get(criteria.listingStatus, 9)
+
+    params = {
+        "al": 1,
+        "num_homes": max(criteria.numPerCity * 3, 200),
+        "ord": "days-on-redfin-asc",
+        "page_number": 1,
+        "sf": "1,2,3,5,6,7",
+        "status": redfin_status,
+        "uipt": 1,
+        "v": 8,
+    }
+    if poly:
+        params["poly"] = poly
+    elif region_id:
+        params["region_id"] = region_id
+        params["region_type"] = 6
+        params["market"] = "sanfrancisco"
+    else:
+        return []
+
+    if criteria.minPrice:
+        params["min_price"] = criteria.minPrice
+    if criteria.maxPrice:
+        params["max_price"] = criteria.maxPrice
+    if criteria.minBeds:
+        params["num_beds"] = criteria.minBeds
+    if criteria.minSqft:
+        params["min_sqft"] = criteria.minSqft
+    if criteria.listingStatus == "recently_sold":
+        params["sold_within_days"] = criteria.soldWithinDays
+
+    try:
+        r = await http.get(
+            "https://www.redfin.com/stingray/api/gis-csv",
+            params=params,
+            headers=REDFIN_HEADERS,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            logger.warning(f"gis-csv returned {r.status_code}")
+            return []
+        reader = csv.DictReader(io.StringIO(r.text))
+        listings = []
+        for row in reader:
+            try:
+                price = int(float(row.get("PRICE", "0") or "0"))
+                beds = int(float(row.get("BEDS", "0") or "0"))
+                baths = float(row.get("BATHS", "0") or "0")
+                sqft = int(float(row.get("SQUARE FEET", "0") or "0"))
+                lot = int(float(row.get("LOT SIZE", "0") or "0"))
+                dom = int(float(row.get("DAYS ON MARKET", "0") or "0"))
+                year_built_str = row.get("YEAR BUILT", "")
+                year_built = int(year_built_str) if year_built_str else None
+                address = row.get("ADDRESS", "Unknown")
+                city_val = row.get("CITY", city_name) or city_name
+                mls_id = row.get("MLS#", "")
+                url = row.get("URL (SEE https://www.redfin.com/buy-a-home/comparative-market-analysis FOR INFO ON PRICING)", "")
+                if not url:
+                    url = row.get("URL", "")
+                lat_val = row.get("LATITUDE", "")
+                lng_val = row.get("LONGITUDE", "")
+                status_val = row.get("STATUS", "Active")
+
+                # Filtering
+                if criteria.minPrice and price < criteria.minPrice:
+                    continue
+                if criteria.maxPrice and price > criteria.maxPrice:
+                    continue
+                if criteria.minBeds and beds < criteria.minBeds:
+                    continue
+                if criteria.maxBeds is not None and beds > criteria.maxBeds:
+                    continue
+                if criteria.minBaths is not None and baths < criteria.minBaths:
+                    continue
+                if criteria.minSqft and sqft > 0 and sqft < criteria.minSqft:
+                    continue
+                if criteria.maxSqft is not None and sqft > 0 and sqft > criteria.maxSqft:
+                    continue
+                if criteria.maxDaysOnMarket is not None and dom > criteria.maxDaysOnMarket:
+                    continue
+
+                # Image URL — use SOURCE column to resolve dataSourceId
+                image_url = ""
+                source = row.get("SOURCE", "")
+                data_source_id = REDFIN_SOURCE_TO_DSID.get(source, 8)
+                if mls_id:
+                    last3 = mls_id[-3:] if len(mls_id) >= 3 else mls_id
+                    image_url = f"https://ssl.cdn-redfin.com/photo/{data_source_id}/bigphoto/{last3}/{mls_id}_0.jpg"
+
+                # Sold info
+                sold_price = None
+                sold_date = None
+                listing_status = criteria.listingStatus
+                if status_val and "sold" in status_val.lower():
+                    listing_status = "recently_sold"
+                    sold_price = price
+                    sold_date_str = row.get("SOLD DATE", "")
+                    if sold_date_str:
+                        try:
+                            sold_date = datetime.strptime(sold_date_str, "%B-%d-%Y").strftime("%Y-%m-%d")
+                        except Exception:
+                            try:
+                                sold_date = datetime.strptime(sold_date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+                            except Exception:
+                                sold_date = sold_date_str
+                elif status_val and "pending" in status_val.lower():
+                    listing_status = "pending"
+                elif status_val and ("contingent" in status_val.lower()):
+                    listing_status = "pending"
+
+                listing = {
+                    "address": address,
+                    "city": city_val,
+                    "price": price,
+                    "bedrooms": beds,
+                    "bathrooms": baths,
+                    "sqft": sqft,
+                    "lotSqft": lot,
+                    "yearBuilt": year_built,
+                    "daysOnMarket": dom,
+                    "url": url if url.startswith("http") else f"https://www.redfin.com{url}",
+                    "imageUrl": image_url,
+                    "mlsId": mls_id,
+                    "remodeled": False,
+                    "remodelYear": None,
+                    "convertibleRooms": False,
+                    "expandable": False,
+                    "notes": "",
+                    "openHouses": None,
+                    "soldPrice": sold_price,
+                    "soldDate": sold_date,
+                    "listingStatus": listing_status,
+                    "latitude": float(lat_val) if lat_val else None,
+                    "longitude": float(lng_val) if lng_val else None,
+                }
+                listings.append(listing)
+            except Exception as e:
+                logger.debug(f"Skipping CSV row: {e}")
+                continue
+
+        # Sort
+        if criteria.listingStatus == "recently_sold":
+            listings.sort(key=lambda l: l.get("soldDate") or "", reverse=True)
+        else:
+            listings.sort(key=lambda l: l["daysOnMarket"])
+        return listings
+    except Exception as e:
+        logger.error(f"fetch_redfin_csv error: {e}")
+        return []
+
+
+def _extract_prices_from_page(listing: dict, text: str):
+    """Extract list price and sold price from Redfin listing page embedded data.
+
+    Validates price history dates: sold date must be after list date,
+    and list date must be within 4 months of sold date.
+    """
+    found_list = False
+    found_sold = False
+
+    # Strategy 1: listingPrice from initialInfo cache
+    # In escaped JSON within the page: \"listingPrice\":\"1998000_US_DOLLAR\"
+    lp = re.search(r'listingPrice\\?"\\?:\s*\\?"(\d{5,})_', text)
+    if lp:
+        listing["price"] = int(lp.group(1))
+        found_list = True
+
+    # Strategy 2: Sold price from the FIRST priceInfo on the page (main listing, not comps).
+    # The first priceInfo always belongs to the main listing.
+    first_pi = re.search(r'\\?"priceInfo\\?":\s*\{\\?"amount\\?":\s*(\d{5,}),\\?"label\\?":\s*\\?"([^\\"]*)\\?"', text)
+    if not first_pi:
+        first_pi = re.search(r'\\?"priceInfo\\?":\s*\{[^}]*?\\?"amount\\?":\s*(\d{5,})[^}]*?\\?"label\\?":\s*\\?"([^\\"]*)\\?"', text)
+    if first_pi and "Sold" in first_pi.group(2):
+        listing["soldPrice"] = int(first_pi.group(1))
+        found_sold = True
+
+    # Strategy 3: Price history events as fallback — with date validation
+    if not found_list or not found_sold:
+        listed_events = []  # [(price, timestamp_ms)]
+        sold_events = []    # [(price, timestamp_ms, date_string)]
+        for m in re.finditer(r'\\?"eventDescription\\?":\s*\\?"(Listed|Sold[^\\"]*)\\?"', text):
+            desc = m.group(1)
+            chunk = text[max(0, m.start() - 600):min(len(text), m.end() + 600)]
+            pm = re.search(r'\\?"price\\?":\s*(\d{5,})', chunk)
+            dm = re.search(r'\\?"eventDate\\?":\s*(\d{10,})', chunk)
+            ds = re.search(r'\\?"eventDateString\\?":\s*\\?"([^\\"]*)\\?"', chunk)
+            if pm:
+                price_val = int(pm.group(1))
+                ts = int(dm.group(1)) if dm else 0
+                ds_val = ds.group(1) if ds else None
+                if desc == "Listed":
+                    listed_events.append((price_val, ts))
+                elif desc.startswith("Sold") and "Public Records" not in desc:
+                    sold_events.append((price_val, ts, ds_val))
+
+        # Validate: find most recent Listed+Sold pair within 4 months of each other
+        four_months_ms = 4 * 30 * 24 * 3600 * 1000
+        if listed_events and sold_events and (not found_list or not found_sold):
+            best_listed = listed_events[0]   # First = most recent
+            best_sold = sold_events[0]
+            sold_ts = best_sold[1]
+            list_ts = best_listed[1]
+            # Sold must be after Listed, and within 4 months
+            if sold_ts > 0 and list_ts > 0:
+                if sold_ts >= list_ts and (sold_ts - list_ts) <= four_months_ms:
+                    if not found_list:
+                        listing["price"] = best_listed[0]
+                        found_list = True
+                    if not found_sold:
+                        listing["soldPrice"] = best_sold[0]
+                        found_sold = True
+                    if best_sold[2]:
+                        listing["soldDate"] = best_sold[2]
+            elif sold_ts == 0 and list_ts == 0:
+                # No timestamps available, use events as-is (first = most recent)
+                if not found_list:
+                    listing["price"] = best_listed[0]
+                    found_list = True
+                if not found_sold:
+                    listing["soldPrice"] = best_sold[0]
+                    found_sold = True
+                if best_sold[2]:
+                    listing["soldDate"] = best_sold[2]
+        elif listed_events and not found_list:
+            listing["price"] = listed_events[0][0]
+            found_list = True
+
+
+_enrich_sem = asyncio.Semaphore(8)
+
+
 async def enrich_listing(listing: dict) -> dict:
-    """Fetch individual listing page to detect remodel, convertible rooms, lot size, etc."""
+    """Fetch individual listing page to extract prices, remodel info, lot size, etc."""
     url = listing.get("url", "")
     if not url or url == "https://www.redfin.com":
         return listing
     try:
-        r = await http.get(url, headers=REDFIN_HEADERS, timeout=10)
+        async with _enrich_sem:
+            r = await http.get(url, headers=REDFIN_HEADERS, timeout=12)
         if r.status_code != 200:
             return listing
         text = r.text
+
+        # Price extraction for sold listings
+        if listing.get("listingStatus") == "recently_sold":
+            _extract_prices_from_page(listing, text)
 
         # Lot size from page
         lot_match = re.search(r'Lot Size[:\s]*([0-9,]+)\s*(?:sq\.?\s*ft|sqft|SF)', text, re.IGNORECASE)
@@ -647,8 +1046,8 @@ async def enrich_listing(listing: dict) -> dict:
         if desc_match:
             listing["notes"] = desc_match.group(1)[:300].replace("\\n", " ").strip()
 
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"enrich_listing error for {url}: {e}")
     return listing
 
 
@@ -745,11 +1144,238 @@ async def scrape_open_houses(listing_url: str) -> list[dict]:
 
 # ─── REDFIN LISTING ENDPOINTS ────────────────────────────────────────────────
 
+# City discovery cache: {rounded_lat_lng: (timestamp, result)}
+_discover_cache: dict[str, tuple[float, list]] = {}
+DISCOVER_CACHE_TTL = 1800  # 30 min
+
+
+class DiscoverRequest(BaseModel):
+    latitude: float
+    longitude: float
+    radiusMiles: int = 50
+
+
+class AddressSearchRequest(BaseModel):
+    address: str
+    criteria: Optional[SearchCriteria] = None
+
+
+@app.post("/cities/discover")
+async def discover_cities(req: DiscoverRequest):
+    """Discover cities with listings near a GPS coordinate using Redfin CSV endpoint."""
+    rounded_key = f"{round(req.latitude, 2)},{round(req.longitude, 2)},{req.radiusMiles}"
+    now = time.time()
+    if rounded_key in _discover_cache:
+        cached_time, cached_result = _discover_cache[rounded_key]
+        if now - cached_time < DISCOVER_CACHE_TTL:
+            return {"cities": cached_result, "cached": True}
+
+    poly = lat_lng_to_poly(req.latitude, req.longitude, req.radiusMiles)
+    # Use minimal criteria for discovery
+    disc_criteria = SearchCriteria(
+        minPrice=0, maxPrice=999_999_999, minBeds=0, minSqft=0,
+        numPerCity=350, listingStatus="for_sale",
+    )
+    params = {
+        "al": 1,
+        "num_homes": 350,
+        "ord": "days-on-redfin-asc",
+        "page_number": 1,
+        "poly": poly,
+        "sf": "1,2,3,5,6,7",
+        "status": 9,
+        "uipt": 1,
+        "v": 8,
+    }
+    try:
+        r = await http.get(
+            "https://www.redfin.com/stingray/api/gis-csv",
+            params=params,
+            headers=REDFIN_HEADERS,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise HTTPException(502, f"Redfin returned {r.status_code}")
+        reader = csv.DictReader(io.StringIO(r.text))
+        city_counts: dict[str, int] = {}
+        for row in reader:
+            city = row.get("CITY", "").strip()
+            if city:
+                city_counts[city] = city_counts.get(city, 0) + 1
+        result = sorted(
+            [{"name": c, "count": n} for c, n in city_counts.items()],
+            key=lambda x: x["count"],
+            reverse=True,
+        )
+        _discover_cache[rounded_key] = (now, result)
+        # Expire old entries
+        expired = [k for k, (t, _) in _discover_cache.items() if now - t > DISCOVER_CACHE_TTL]
+        for k in expired:
+            del _discover_cache[k]
+        return {"cities": result, "cached": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"discover_cities error: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/listings/search-address")
+async def search_by_address(req: AddressSearchRequest):
+    """Search for a specific property by address using geocoding + tiny poly search."""
+    gkey = get_google_key()
+    loc = await geocode(req.address, gkey)
+    if not loc:
+        raise HTTPException(404, f"Could not geocode address: {req.address}")
+    # Tiny poly (~0.3 mi) around the address
+    poly = lat_lng_to_poly(loc["lat"], loc["lng"], 0.3)
+    # Search all statuses
+    criteria_active = SearchCriteria(
+        minPrice=0, maxPrice=999_999_999, minBeds=0, minSqft=0,
+        numPerCity=50, listingStatus="for_sale",
+    )
+    criteria_sold = SearchCriteria(
+        minPrice=0, maxPrice=999_999_999, minBeds=0, minSqft=0,
+        numPerCity=50, listingStatus="recently_sold", soldWithinDays=730,
+    )
+    criteria_pending = SearchCriteria(
+        minPrice=0, maxPrice=999_999_999, minBeds=0, minSqft=0,
+        numPerCity=50, listingStatus="pending",
+    )
+    results = await asyncio.gather(
+        fetch_redfin_csv(criteria_active, poly=poly, status_override=9),
+        fetch_redfin_csv(criteria_sold, poly=poly, status_override=130),
+        fetch_redfin_csv(criteria_pending, poly=poly, status_override=2),
+    )
+    all_listings = []
+    for batch in results:
+        all_listings.extend(batch)
+
+    # Fuzzy match by address
+    query_parts = set(re.sub(r'[^a-z0-9\s]', '', req.address.lower()).split())
+    matched = []
+    for listing in all_listings:
+        if not listing.get("address"):
+            continue
+        addr_parts = set(re.sub(r'[^a-z0-9\s]', '', listing["address"].lower()).split())
+        overlap = len(query_parts & addr_parts)
+        if overlap >= min(2, len(query_parts)):
+            matched.append((overlap, listing))
+    matched.sort(key=lambda x: x[0], reverse=True)
+    final = [m[1] for m in matched]
+
+    # Deduplicate by address
+    seen_addrs = set()
+    deduped = []
+    scoring_criteria = req.criteria or SearchCriteria()
+    for l in final:
+        key = l["address"].lower().strip()
+        if key not in seen_addrs:
+            seen_addrs.add(key)
+            l["score"] = compute_score(l, scoring_criteria)
+            l["id"] = len(deduped) + 1
+            l["addedDate"] = datetime.now().strftime("%Y-%m-%d")
+            deduped.append(l)
+    if not deduped:
+        # Return all nearby even without fuzzy match
+        for i, l in enumerate(all_listings[:20]):
+            l["id"] = i + 1
+            l["score"] = compute_score(l, scoring_criteria)
+            l["addedDate"] = datetime.now().strftime("%Y-%m-%d")
+        deduped = all_listings[:20]
+
+    # Enrich sold listings to get correct list prices
+    sold = [l for l in deduped if l.get("listingStatus") == "recently_sold"]
+    if sold:
+        await asyncio.gather(*[enrich_listing(l) for l in sold])
+
+    return {"listings": deduped, "count": len(deduped), "geocoded": loc}
+
+
+@app.get("/address/autocomplete")
+async def address_autocomplete(q: str = ""):
+    """Autocomplete addresses using Nominatim (free, no API key)."""
+    q = q.strip()
+    if len(q) < 5:
+        return {"suggestions": []}
+    try:
+        r = await http.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": q,
+                "format": "json",
+                "limit": 5,
+                "countrycodes": "us",
+                "addressdetails": 1,
+            },
+            headers={"User-Agent": "OpenHouseApp/1.0"},
+        )
+        results = r.json()
+        suggestions = []
+        for item in results:
+            display = item.get("display_name", "")
+            # Shorten: take first 3 parts (street, city, county or state)
+            parts = [p.strip() for p in display.split(",")]
+            short = ", ".join(parts[:3]) if len(parts) >= 3 else display
+            suggestions.append({
+                "display": short,
+                "full": display,
+                "lat": float(item["lat"]),
+                "lng": float(item["lon"]),
+            })
+        return {"suggestions": suggestions}
+    except Exception:
+        return {"suggestions": []}
+
+
+def _parse_statuses(listing_status: str) -> list[str]:
+    """Parse comma-separated status string into list."""
+    return [s.strip() for s in listing_status.split(",") if s.strip()]
+
+
+async def _fetch_for_status(
+    criteria: SearchCriteria, status: str, known_cities: list[str],
+    unknown_cities: list[str], has_location: bool,
+) -> list[dict]:
+    """Fetch listings for a single status, handling CSV vs JSON routing."""
+    use_csv = status in ("recently_sold", "pending")
+    status_map = {"for_sale": 9, "recently_sold": 130, "pending": 2}
+    # Create a single-status copy of criteria for the fetch functions
+    single = criteria.model_copy()
+    single.listingStatus = status
+    results = []
+
+    if known_cities:
+        if use_csv:
+            tasks = [
+                fetch_redfin_csv(single, region_id=REDFIN_CITIES[c]["region_id"], city_name=c)
+                for c in known_cities
+            ]
+        else:
+            tasks = [fetch_redfin_api(c, REDFIN_CITIES[c], single) for c in known_cities]
+        city_results = await asyncio.gather(*tasks)
+        for batch in city_results:
+            results.extend(batch)
+
+    if (unknown_cities or (not known_cities)) and has_location:
+        poly = lat_lng_to_poly(single.latitude, single.longitude, single.radiusMiles)
+        if use_csv:
+            poly_results = await fetch_redfin_csv(single, poly=poly)
+        else:
+            poly_results = await fetch_redfin_api("", {}, single, poly=poly)
+        if unknown_cities:
+            poly_results = [l for l in poly_results if l.get("city", "").strip() in unknown_cities]
+        results.extend(poly_results)
+
+    return results
+
+
 @app.post("/listings/search")
 async def search_listings(criteria: SearchCriteria):
     """
-    Search Redfin for listings matching criteria. Fast: no enrichment, limited per city.
-    Results cached for 1 hour per unique criteria set.
+    Search Redfin for listings matching criteria.
+    Supports comma-separated listingStatus (e.g. "recently_sold,pending").
+    Uses CSV endpoint for sold/pending, JSON for active.
     """
     cache_key = json.dumps(criteria.model_dump(), sort_keys=True)
     now = time.time()
@@ -758,21 +1384,31 @@ async def search_listings(criteria: SearchCriteria):
         if now - cached_time < CACHE_TTL:
             return {"listings": cached_results, "cached": True, "count": len(cached_results)}
 
-    valid_cities = [c for c in criteria.cities if c in REDFIN_CITIES]
-    if not valid_cities:
-        raise HTTPException(400, f"No valid cities. Available: {list(REDFIN_CITIES.keys())}")
+    statuses = _parse_statuses(criteria.listingStatus)
+    known_cities = [c for c in criteria.cities if c in REDFIN_CITIES]
+    unknown_cities = [c for c in criteria.cities if c not in REDFIN_CITIES]
+    has_location = criteria.latitude is not None and criteria.longitude is not None
 
-    # Fetch all cities concurrently (fast — no enrichment)
-    tasks = [
-        fetch_redfin_api(city, REDFIN_CITIES[city], criteria)
-        for city in valid_cities
+    if not known_cities and not has_location:
+        if unknown_cities:
+            logger.warning(f"Unknown cities without lat/lng: {unknown_cities}")
+
+    # Fetch all statuses concurrently
+    status_tasks = [
+        _fetch_for_status(criteria, s, known_cities, unknown_cities, has_location)
+        for s in statuses
     ]
-    city_results = await asyncio.gather(*tasks)
+    status_results = await asyncio.gather(*status_tasks)
     all_listings = []
-    for listings in city_results:
-        all_listings.extend(listings)
+    for batch in status_results:
+        all_listings.extend(batch)
 
-    # Score, sort by DOM, assign IDs
+    # Enrich sold listings to get correct list prices from individual pages
+    sold = [l for l in all_listings if l.get("listingStatus") == "recently_sold"]
+    if sold:
+        await asyncio.gather(*[enrich_listing(l) for l in sold])
+
+    # Score, sort, assign IDs
     for i, listing in enumerate(all_listings):
         listing["id"] = i + 1
         listing["score"] = compute_score(listing, criteria)
@@ -791,11 +1427,30 @@ async def search_listings(criteria: SearchCriteria):
 
 @app.post("/listings/search/{city}")
 async def search_city(city: str, criteria: SearchCriteria):
-    """Search a single city. Used for per-city streaming from the iOS app."""
-    if city not in REDFIN_CITIES:
-        raise HTTPException(400, f"Unknown city: {city}. Available: {list(REDFIN_CITIES.keys())}")
+    """Search a single city. Supports multi-status."""
+    statuses = _parse_statuses(criteria.listingStatus)
+    has_location = criteria.latitude is not None and criteria.longitude is not None
 
-    listings = await fetch_redfin_api(city, REDFIN_CITIES[city], criteria)
+    known = [city] if city in REDFIN_CITIES else []
+    unknown = [city] if city not in REDFIN_CITIES else []
+
+    if not known and not has_location:
+        raise HTTPException(400, f"Unknown city '{city}' and no lat/lng provided for poly search")
+
+    status_tasks = [
+        _fetch_for_status(criteria, s, known, unknown, has_location)
+        for s in statuses
+    ]
+    status_results = await asyncio.gather(*status_tasks)
+    listings = []
+    for batch in status_results:
+        listings.extend(batch)
+
+    # Enrich sold listings to get correct list prices
+    sold = [l for l in listings if l.get("listingStatus") == "recently_sold"]
+    if sold:
+        await asyncio.gather(*[enrich_listing(l) for l in sold])
+
     for i, listing in enumerate(listings):
         listing["id"] = i + 1
         listing["score"] = compute_score(listing, criteria)
@@ -814,40 +1469,82 @@ async def get_open_houses(url: str):
     return {"events": events, "url": url}
 
 
+@app.post("/listings/check-sold")
+async def check_if_sold(request: dict):
+    """Check if a Redfin listing has sold by fetching its page.
+
+    Uses the FIRST longerDefinitionToken on the page to detect the main listing's
+    current status. The first token always belongs to the main listing, not comps.
+    - "sold" = currently sold
+    - "pending" = pending/contingent
+    - "active" = still for sale
+    """
+    url = request.get("url", "")
+    if not url.startswith("https://www.redfin.com/"):
+        raise HTTPException(400, "Invalid Redfin URL")
+    try:
+        r = await http.get(url, headers=REDFIN_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return {"sold": False, "soldPrice": None, "soldDate": None, "listPrice": None, "status": "unknown"}
+        text = r.text
+
+        # Detect current status from the FIRST longerDefinitionToken (main listing)
+        # Format in HTML: longerDefinitionToken\":\"sold\" (escaped quotes)
+        status_match = re.search(r'longerDefinitionToken\\?"\\?:\s*\\?"(active|sold|pending|contingent)\\?"', text)
+        page_status = status_match.group(1) if status_match else "unknown"
+
+        if page_status == "sold":
+            listing = {"listingStatus": "recently_sold", "price": 0, "soldPrice": None, "soldDate": None}
+            _extract_prices_from_page(listing, text)
+            return {
+                "sold": True,
+                "soldPrice": listing.get("soldPrice"),
+                "soldDate": listing.get("soldDate"),
+                "listPrice": listing.get("price") if listing.get("price", 0) > 0 else None,
+                "status": "recently_sold",
+                "url": url,
+            }
+        else:
+            status = "pending" if page_status in ("pending", "contingent") else "for_sale"
+            return {"sold": False, "soldPrice": None, "soldDate": None, "listPrice": None, "status": status, "url": url}
+    except Exception as e:
+        logger.error(f"check_if_sold error: {e}")
+        return {"sold": False, "soldPrice": None, "soldDate": None, "listPrice": None, "status": "for_sale", "error": str(e)}
+
+
 # ─── TESLA PROXY ──────────────────────────────────────────────────────────────
 
 @app.get("/vehicles")
-async def get_vehicles(authorization: str = Header(...)):
-    r = await http.get(
-        f"{TESLA_BASE}/vehicles",
-        headers={"Authorization": authorization},
-    )
+async def get_vehicles(authorization: str = Header(...),
+                       x_refresh_token: Optional[str] = Header(None)):
+    r, tokens = await tesla_request("GET", "/vehicles", authorization, x_refresh_token or "")
     if r.status_code != 200:
         raise HTTPException(r.status_code, r.text)
     data = r.json()
-    # Log vehicle fields to debug option_codes/color availability
     for v in data.get("response", []):
-        logger.info(f"Vehicle '{v.get('display_name')}': option_codes={v.get('option_codes', 'MISSING')}, color={v.get('color', 'MISSING')}, vin={v.get('vin', '?')}, keys={list(v.keys())}")
-    return data
+        logger.info(f"Vehicle '{v.get('display_name')}': option_codes={v.get('option_codes', 'MISSING')}, color={v.get('color', 'MISSING')}")
+    resp = JSONResponse(content=data)
+    add_token_headers(resp, tokens)
+    return resp
 
 
 @app.post("/vehicles/{vehicle_id}/wake")
-async def wake_vehicle(vehicle_id: str, authorization: str = Header(...)):
+async def wake_vehicle(vehicle_id: str, authorization: str = Header(...),
+                       x_refresh_token: Optional[str] = Header(None)):
     """Wake vehicle and poll until online (up to ~30 seconds)."""
-    headers = {"Authorization": authorization}
-
-    # Send initial wake command
-    r = await http.post(
-        f"{TESLA_BASE}/vehicles/{vehicle_id}/wake_up",
-        headers=headers,
-    )
+    # Auto-refresh token if needed
+    r, tokens = await tesla_request("POST", f"/vehicles/{vehicle_id}/wake_up",
+                                     authorization, x_refresh_token or "")
+    auth = authorization
+    if tokens:
+        auth = f"Bearer {tokens['access_token']}"
     logger.info(f"Wake request for {vehicle_id}: status={r.status_code}")
 
     # If wake_up fails, try /wake endpoint
     if r.status_code != 200:
         r = await http.post(
             f"{TESLA_BASE}/vehicles/{vehicle_id}/wake",
-            headers=headers,
+            headers={"Authorization": auth},
         )
         logger.info(f"Wake fallback for {vehicle_id}: status={r.status_code}")
 
@@ -864,34 +1561,40 @@ async def wake_vehicle(vehicle_id: str, authorization: str = Header(...)):
     for attempt in range(6):
         if state == "online":
             logger.info(f"Vehicle {vehicle_id} is online after {attempt} poll(s)")
-            return data
+            resp = JSONResponse(content=data)
+            add_token_headers(resp, tokens)
+            return resp
         await asyncio.sleep(5)
         try:
             check = await http.get(
                 f"{TESLA_BASE}/vehicles/{vehicle_id}",
-                headers=headers,
+                headers={"Authorization": auth},
             )
             if check.status_code == 200:
                 check_data = check.json()
                 state = check_data.get("response", {}).get("state", "unknown")
                 logger.info(f"Wake poll {attempt+1} for {vehicle_id}: state={state}")
                 if state == "online":
-                    return check_data
+                    resp = JSONResponse(content=check_data)
+                    add_token_headers(resp, tokens)
+                    return resp
         except Exception as e:
             logger.error(f"Wake poll error for {vehicle_id}: {e}")
 
     logger.warning(f"Vehicle {vehicle_id} did not come online after polling")
-    return data
+    resp = JSONResponse(content=data)
+    add_token_headers(resp, tokens)
+    return resp
 
 
 @app.post("/vehicles/{vehicle_id}/navigate")
 async def send_navigation(vehicle_id: str, body: NavigateRequest,
-                          authorization: str = Header(...)):
+                          authorization: str = Header(...),
+                          x_refresh_token: Optional[str] = Header(None)):
     if not body.stops:
         raise HTTPException(400, "No stops provided")
 
     # Build Google Maps multi-stop URL using /dir/ format
-    # Tesla's nav parses this into a multi-waypoint route
     if len(body.stops) == 1:
         maps_url = f"https://maps.google.com/maps?daddr={urllib.parse.quote(body.stops[0])}"
     else:
@@ -909,15 +1612,11 @@ async def send_navigation(vehicle_id: str, body: NavigateRequest,
 
     logger.info(f"Sending nav to vehicle {vehicle_id}: {maps_url}")
 
-    try:
-        r = await http.post(
-            f"{TESLA_BASE}/vehicles/{vehicle_id}/command/navigation_request",
-            json=payload,
-            headers={"Authorization": authorization, "Content-Type": "application/json"},
-        )
-    except Exception as e:
-        logger.error(f"Navigation request failed: {e}")
-        raise HTTPException(502, f"Failed to reach Tesla API: {e}")
+    r, tokens = await tesla_request(
+        "POST", f"/vehicles/{vehicle_id}/command/navigation_request",
+        authorization, x_refresh_token or "",
+        json=payload, headers={"Content-Type": "application/json"},
+    )
 
     if r.status_code != 200:
         logger.error(f"Tesla nav response {r.status_code}: {r.text[:500]}")
@@ -932,20 +1631,24 @@ async def send_navigation(vehicle_id: str, body: NavigateRequest,
         reason = data.get("response", {}).get("reason", "Unknown")
         raise HTTPException(400, f"Tesla rejected command: {reason}")
 
-    return {"ok": True, "stops_sent": len(body.stops)}
+    resp = JSONResponse(content={"ok": True, "stops_sent": len(body.stops)})
+    add_token_headers(resp, tokens)
+    return resp
 
 
 # ─── VEHICLE DATA + COMMANDS ──────────────────────────────────────────────
 
 @app.get("/vehicles/{vehicle_id}/vehicle_data")
-async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
+async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...),
+                           x_refresh_token: Optional[str] = Header(None)):
     """Proxy Tesla vehicle_data → flattened battery/climate/sentry status."""
     try:
-        # Try Fleet API first
-        r = await http.get(
-            f"{TESLA_BASE}/vehicles/{vehicle_id}/vehicle_data",
-            headers={"Authorization": authorization},
-        )
+        # Try Fleet API first, with auto-refresh
+        r, tokens = await tesla_request("GET", f"/vehicles/{vehicle_id}/vehicle_data",
+                                         authorization, x_refresh_token or "")
+        auth = authorization
+        if tokens:
+            auth = f"Bearer {tokens['access_token']}"
         logger.info(f"vehicle_data for {vehicle_id}: status={r.status_code}")
 
         # If Fleet API returns 403 (virtual key not installed), try the data_request endpoint
@@ -953,15 +1656,15 @@ async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
             logger.info(f"Fleet API 403, trying data_request for {vehicle_id}")
             r2 = await http.get(
                 f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/charge_state",
-                headers={"Authorization": authorization},
+                headers={"Authorization": auth},
             )
             r3 = await http.get(
                 f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/climate_state",
-                headers={"Authorization": authorization},
+                headers={"Authorization": auth},
             )
             r4 = await http.get(
                 f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/vehicle_state",
-                headers={"Authorization": authorization},
+                headers={"Authorization": auth},
             )
             logger.info(f"data_request statuses: charge={r2.status_code}, climate={r3.status_code}, vehicle={r4.status_code}")
 
@@ -972,12 +1675,12 @@ async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
             # Try to get vehicle_config for exterior_color
             r5 = await http.get(
                 f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/vehicle_config",
-                headers={"Authorization": authorization},
+                headers={"Authorization": auth},
             )
             config = r5.json().get("response", {}) if r5.status_code == 200 else {}
             logger.info(f"data_request vehicle_config for {vehicle_id}: status={r5.status_code}, color={config.get('exterior_color', 'N/A')}")
 
-            return {
+            result = {
                 "battery_level": charge.get("battery_level", 0),
                 "battery_range": charge.get("battery_range", 0),
                 "is_climate_on": climate.get("is_climate_on", False),
@@ -988,6 +1691,9 @@ async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
                 "exterior_color": config.get("exterior_color"),
                 "paint_color": config.get("paint_color"),
             }
+            resp = JSONResponse(content=result)
+            add_token_headers(resp, tokens)
+            return resp
 
         if r.status_code != 200:
             logger.error(f"vehicle_data error body: {r.text[:500]}")
@@ -1002,7 +1708,7 @@ async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
         vehicle = data.get("vehicle_state") or {}
         config = data.get("vehicle_config") or {}
 
-        return {
+        result = {
             "battery_level": charge.get("battery_level", 0),
             "battery_range": charge.get("battery_range", 0),
             "is_climate_on": climate.get("is_climate_on", False),
@@ -1013,6 +1719,9 @@ async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
             "exterior_color": config.get("exterior_color"),
             "paint_color": config.get("paint_color"),
         }
+        resp = JSONResponse(content=result)
+        add_token_headers(resp, tokens)
+        return resp
     except HTTPException:
         raise
     except Exception as e:
@@ -1022,13 +1731,21 @@ async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
 
 @app.post("/vehicles/{vehicle_id}/command/climate")
 async def set_climate(vehicle_id: str, body: ClimateRequest,
-                      authorization: str = Header(...)):
+                      authorization: str = Header(...),
+                      x_refresh_token: Optional[str] = Header(None)):
     """Start/stop climate and optionally set temperature."""
-    headers = {"Authorization": authorization, "Content-Type": "application/json"}
+    # Auto-refresh token if needed via a simple test call
+    auth = authorization
+    if x_refresh_token:
+        # Quick check if token is valid
+        test_r, tokens = await tesla_request("GET", "/vehicles", authorization, x_refresh_token)
+        if tokens:
+            auth = f"Bearer {tokens['access_token']}"
+
+    headers = {"Authorization": auth, "Content-Type": "application/json"}
     logger.info(f"Climate command for {vehicle_id}: on={body.on}, temp_c={body.temp_c}")
 
     if body.on:
-        # Set temperature first if provided
         if body.temp_c is not None:
             tr = await http.post(
                 f"{TESLA_BASE}/vehicles/{vehicle_id}/command/set_temps",
@@ -1052,7 +1769,11 @@ async def set_climate(vehicle_id: str, body: ClimateRequest,
     if r.status_code != 200:
         raise HTTPException(r.status_code, r.text)
     try:
-        return r.json()
+        resp_data = r.json()
+        resp = JSONResponse(content=resp_data)
+        if x_refresh_token and 'tokens' in dir() and tokens:
+            add_token_headers(resp, tokens)
+        return resp
     except Exception:
         raise HTTPException(502, f"Tesla returned non-JSON: {r.text[:200]}")
 
@@ -1139,7 +1860,7 @@ async def tesla_auth():
         "client_id": TESLA_CLIENT_ID,
         "redirect_uri": TESLA_REDIRECT_URI,
         "response_type": "code",
-        "scope": "openid vehicle_device_data vehicle_cmds",
+        "scope": "openid offline_access vehicle_device_data vehicle_cmds",
         "state": "teslanav",
     })
     auth_url = f"{TESLA_AUTH_BASE}/authorize?{params}"
@@ -1169,22 +1890,26 @@ async def tesla_callback(code: str, state: str = ""):
         raise HTTPException(r.status_code, f"Token exchange failed: {r.text}")
 
     tokens = r.json()
+    logger.info(f"Token exchange keys: {list(tokens.keys())}")
     access_token = tokens.get("access_token", "")
     refresh_token = tokens.get("refresh_token", "")
     expires_in = tokens.get("expires_in", 0)
+    logger.info(f"Got tokens: access={'yes' if access_token else 'no'}, refresh={'yes' if refresh_token else 'no'}, expires_in={expires_in}")
 
     from fastapi.responses import HTMLResponse
     return HTMLResponse(f"""
     <html>
     <body style="background:#000;color:#fff;font-family:monospace;padding:40px;">
     <h2 style="color:#FFD200;">Tesla Authorization Successful</h2>
-    <p>Copy this access token and paste it into the TeslaNav app Settings:</p>
+    <p>Copy <b>both</b> tokens into the TeslaNav app Settings:</p>
+    <p style="color:#0f0;">Access Token:</p>
     <textarea style="width:100%;height:80px;background:#111;color:#0f0;border:1px solid #333;
     font-family:monospace;padding:10px;font-size:13px;" readonly onclick="this.select()">{access_token}</textarea>
-    <p style="color:#888;">Token expires in {expires_in // 3600} hours.</p>
-    <p style="color:#888;">Refresh token (save this for later):</p>
-    <textarea style="width:100%;height:60px;background:#111;color:#888;border:1px solid #333;
-    font-family:monospace;padding:10px;font-size:11px;" readonly onclick="this.select()">{refresh_token}</textarea>
+    <p style="color:#888;">Expires in {expires_in // 3600} hours — auto-refreshes if you set the refresh token below.</p>
+    <p style="color:#FFD200;">Refresh Token (required for auto-refresh):</p>
+    <textarea style="width:100%;height:80px;background:#111;color:#FFD200;border:1px solid #555;
+    font-family:monospace;padding:10px;font-size:13px;" readonly onclick="this.select()">{refresh_token}</textarea>
+    <p style="color:#888;">Paste this into "Tesla refresh token" in Settings. The app will automatically refresh your access token — no more manual sign-ins.</p>
     </body></html>
     """)
 

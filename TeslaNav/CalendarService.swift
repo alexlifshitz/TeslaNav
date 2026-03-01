@@ -32,9 +32,14 @@ class CalendarService: ObservableObject {
         let now = Date()
         let end = Calendar.current.date(byAdding: .hour, value: 48, to: now)!
 
-        // Explicitly include ALL calendars from all sources
+        // Only include personal calendars (iCloud, Google, Local) — skip Exchange/Office 365 (work)
         let allCalendars = store.calendars(for: .event)
-        let predicate = store.predicateForEvents(withStart: now, end: end, calendars: allCalendars)
+        let personalCalendars = allCalendars.filter { cal in
+            let sourceType = cal.source.sourceType
+            // Exclude Exchange (work) calendars
+            return sourceType != .exchange
+        }
+        let predicate = store.predicateForEvents(withStart: now, end: end, calendars: personalCalendars.isEmpty ? allCalendars : personalCalendars)
         let ekEvents = store.events(matching: predicate)
 
         upcomingEvents = ekEvents.compactMap { event in
