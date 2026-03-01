@@ -18,6 +18,14 @@ struct ContentView: View {
                 .navigationBarHidden(true)
                 .sheet(isPresented: $showSettings) { SettingsView(tesla: tesla) }
                 .task { [tesla] in await tesla.loadVehicles() }
+                .task { [tesla] in
+                    // Refresh vehicle status every 30 seconds while app is open
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 30_000_000_000)
+                        guard !tesla.vehicles.isEmpty else { continue }
+                        await tesla.loadAllVehicleData()
+                    }
+                }
                 .task { [calendar] in
                     if AppSettings.current.calendarEnabled { await calendar.requestAccess() }
                 }
