@@ -6,18 +6,26 @@ Install: pip install fastapi uvicorn httpx python-dotenv
 Run:     uvicorn main:app --reload --port 8000
 """
 
-import os, re, json, time, asyncio, urllib.parse
+import os, re, json, time, asyncio, urllib.parse, logging, traceback
 from typing import Optional
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("teslanav")
 
 app = FastAPI(title="Tesla Nav Proxy")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled error on {request.method} {request.url.path}: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 app.add_middleware(
     CORSMiddleware,
@@ -122,6 +130,8 @@ class SearchCriteria(BaseModel):
     sqftPreferred: int = 2000
     lotSqftMin: int = 5500
     remodelPreference: str = "any"  # "must", "prefer", "any", "open_to_renovating"
+    maxDaysOnMarket: Optional[int] = None  # None = no limit
+    numPerCity: int = 10  # max listings per city
 
 
 # ─── GOOGLE MAPS HELPERS ─────────────────────────────────────────────────────
@@ -423,8 +433,8 @@ async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCrit
     params = {
         "al": 1,
         "market": "sanfrancisco",
-        "num_homes": 100,
-        "ord": "redfin-recommended-asc",
+        "num_homes": max(criteria.numPerCity * 2, 50),  # fetch extra to filter from
+        "ord": "days-on-redfin-asc",  # newest first
         "page_number": 1,
         "region_id": city_info["region_id"],
         "region_type": 6,
@@ -453,49 +463,140 @@ async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCrit
         homes = data.get("payload", {}).get("homes", [])
         listings = []
         for h in homes:
-            hd = h.get("homeData", {})
-            addr_info = hd.get("addressInfo", {})
-            price_info = h.get("priceInfo", {})
-            sqft_info = hd.get("sqFt", {})
-            lot_info = hd.get("lotSize", {})
+            # Redfin GIS API returns flat structure (not nested under homeData)
+            # Price
+            price_obj = h.get("price", {})
+            price = price_obj.get("value", 0) if isinstance(price_obj, dict) else (price_obj or 0)
 
-            price = price_info.get("amount", 0) if isinstance(price_info, dict) else 0
-            if not price:
-                price = hd.get("priceInfo", {}).get("amount", 0)
+            # Address
+            street_obj = h.get("streetLine", {})
+            address = street_obj.get("value", "Unknown") if isinstance(street_obj, dict) else (street_obj or "Unknown")
+            city_val = h.get("city", city_name)
 
+            # Sqft / Lot
+            sqft_obj = h.get("sqFt", {})
+            sqft = sqft_obj.get("value", 0) if isinstance(sqft_obj, dict) else (sqft_obj or 0)
+            lot_obj = h.get("lotSize", {})
+            lot = lot_obj.get("value", 0) if isinstance(lot_obj, dict) else (lot_obj or 0)
+
+            # Year built
+            yb_obj = h.get("yearBuilt", {})
+            year_built = yb_obj.get("value") if isinstance(yb_obj, dict) else yb_obj
+
+            # Days on market (dom.value is the correct field)
+            dom_obj = h.get("dom", {})
+            dom = dom_obj.get("value", 0) if isinstance(dom_obj, dict) else (dom_obj or 0)
+            dom = int(dom) if dom else 0
+
+            # Filter by max days on market
+            if criteria.maxDaysOnMarket is not None and dom > criteria.maxDaysOnMarket:
+                continue
+
+            # MLS ID
+            mls_obj = h.get("mlsId", {})
+            mls_id = mls_obj.get("value", "") if isinstance(mls_obj, dict) else ""
+
+            # Photo URL — pattern: /photo/{dataSourceId}/bigphoto/{last3ofMLS}/{MLS_ID}_0.jpg
             image_url = ""
-            photos = hd.get("photos")
-            if isinstance(photos, dict):
-                photo_list = photos.get("photos", [])
-                if photo_list and isinstance(photo_list, list):
-                    first = photo_list[0] if photo_list else {}
-                    if isinstance(first, dict):
-                        urls = first.get("photoUrls", {})
-                        if isinstance(urls, dict):
-                            image_url = urls.get("fullScreenPhotoUrl", urls.get("nonFullScreenPhotoUrl", ""))
-            if not image_url:
-                image_url = hd.get("staticMapUrl", "")
+            data_source_id = h.get("dataSourceId", 0)
+            if mls_id:
+                last3 = mls_id[-3:] if len(mls_id) >= 3 else mls_id
+                image_url = f"https://ssl.cdn-redfin.com/photo/{data_source_id}/bigphoto/{last3}/{mls_id}_0.jpg"
+
+            # Open house info — use timestamps for accurate start/end
+            open_houses = []
+            oh_start_ts = h.get("openHouseStart")
+            oh_end_ts = h.get("openHouseEnd")
+            if oh_start_ts and oh_end_ts:
+                try:
+                    from datetime import timezone
+                    start_dt = datetime.fromtimestamp(int(oh_start_ts) / 1000)
+                    end_dt = datetime.fromtimestamp(int(oh_end_ts) / 1000)
+                    open_houses.append({
+                        "date": start_dt.strftime("%b %d"),
+                        "startTime": start_dt.strftime("%-I:%M %p"),
+                        "endTime": end_dt.strftime("%-I:%M %p"),
+                    })
+                except Exception:
+                    pass
+            if not open_houses:
+                # Fallback: parse eventName "Open House - 1:00 - 4:00 PM"
+                oh_event = h.get("openHouseEventName", "")
+                oh_start_fmt = h.get("openHouseStartFormatted", "")
+                if oh_event and oh_start_fmt:
+                    import re as _re
+                    time_match = _re.findall(r'(\d{1,2}:\d{2})\s*(?:-\s*)?(\d{1,2}:\d{2}\s*[AP]M)', oh_event)
+                    if time_match:
+                        start_t, end_t = time_match[0]
+                        # Add AM/PM to start if missing — assume same meridian as end
+                        if "AM" not in start_t.upper() and "PM" not in start_t.upper():
+                            meridian = "PM" if "PM" in end_t.upper() else "AM"
+                            start_t = f"{start_t} {meridian}"
+                        date_part = oh_start_fmt.split(",")[0].strip() if "," in oh_start_fmt else oh_start_fmt
+                        open_houses.append({
+                            "date": date_part,
+                            "startTime": start_t,
+                            "endTime": end_t,
+                        })
+
+            # Detect features from listingRemarks and listingTags
+            remarks = (h.get("listingRemarks", "") or "").lower()
+            tags_list = h.get("listingTags", []) or []
+            tags_lower = " ".join(t.lower() for t in tags_list)
+            combined_text = remarks + " " + tags_lower
+
+            remodeled = any(kw in combined_text for kw in REMODEL_KW)
+            convertible = any(kw in combined_text for kw in CONVERT_KW)
+            expandable = any(kw in combined_text for kw in EXPAND_KW)
+
+            remodel_year = None
+            if remodeled:
+                yr_match = re.search(r'(?:remodel|renovate|update)(?:ed|d)?\s+(?:in\s+)?(\d{4})', combined_text)
+                if yr_match:
+                    remodel_year = int(yr_match.group(1))
+
+            # Key facts as notes
+            key_facts = h.get("keyFacts", [])
+            notes = ". ".join(kf.get("description", "") for kf in (key_facts or []) if kf.get("description"))
+            if remarks:
+                notes = remarks[:300]
+
+            beds = h.get("beds") or 0
+            baths = h.get("baths") or 0
+
+            # Strict post-fetch filtering — Redfin API doesn't always respect params
+            if int(price) < criteria.minPrice or int(price) > criteria.maxPrice:
+                continue
+            if beds < criteria.minBeds:
+                continue
+            if int(sqft) < criteria.minSqft and int(sqft) > 0:
+                continue
 
             listing = {
-                "address": addr_info.get("streetAddress", "Unknown"),
-                "city": city_name,
-                "price": price,
-                "bedrooms": hd.get("beds") or 0,
-                "bathrooms": hd.get("baths") or 0,
-                "sqft": sqft_info.get("value", 0) if isinstance(sqft_info, dict) else (sqft_info or 0),
-                "lotSqft": lot_info.get("value", 0) if isinstance(lot_info, dict) else (lot_info or 0),
-                "yearBuilt": hd.get("yearBuilt"),
-                "url": "https://www.redfin.com" + hd.get("url", ""),
+                "address": address,
+                "city": city_val,
+                "price": int(price),
+                "bedrooms": beds,
+                "bathrooms": baths,
+                "sqft": int(sqft),
+                "lotSqft": int(lot),
+                "yearBuilt": year_built,
+                "daysOnMarket": dom,
+                "url": "https://www.redfin.com" + (h.get("url", "") or ""),
                 "imageUrl": image_url,
-                "mlsId": hd.get("mlsId", {}).get("value", "") if isinstance(hd.get("mlsId"), dict) else "",
-                "remodeled": False,
-                "remodelYear": None,
-                "convertibleRooms": False,
-                "expandable": False,
-                "notes": "",
+                "mlsId": mls_id,
+                "remodeled": remodeled,
+                "remodelYear": remodel_year,
+                "convertibleRooms": convertible,
+                "expandable": expandable,
+                "notes": notes,
+                "openHouses": open_houses if open_houses else None,
             }
             listings.append(listing)
-        return listings
+
+        # Sort by days on market (newest first) and limit
+        listings.sort(key=lambda l: l["daysOnMarket"])
+        return listings[:criteria.numPerCity]
     except Exception:
         return []
 
@@ -647,10 +748,9 @@ async def scrape_open_houses(listing_url: str) -> list[dict]:
 @app.post("/listings/search")
 async def search_listings(criteria: SearchCriteria):
     """
-    Search Redfin for listings matching criteria. Returns scored + enriched listings.
+    Search Redfin for listings matching criteria. Fast: no enrichment, limited per city.
     Results cached for 1 hour per unique criteria set.
     """
-    # Build cache key from criteria
     cache_key = json.dumps(criteria.model_dump(), sort_keys=True)
     now = time.time()
     if cache_key in _listings_cache:
@@ -658,12 +758,11 @@ async def search_listings(criteria: SearchCriteria):
         if now - cached_time < CACHE_TTL:
             return {"listings": cached_results, "cached": True, "count": len(cached_results)}
 
-    # Validate cities
     valid_cities = [c for c in criteria.cities if c in REDFIN_CITIES]
     if not valid_cities:
         raise HTTPException(400, f"No valid cities. Available: {list(REDFIN_CITIES.keys())}")
 
-    # Fetch from all cities concurrently
+    # Fetch all cities concurrently (fast — no enrichment)
     tasks = [
         fetch_redfin_api(city, REDFIN_CITIES[city], criteria)
         for city in valid_cities
@@ -673,33 +772,37 @@ async def search_listings(criteria: SearchCriteria):
     for listings in city_results:
         all_listings.extend(listings)
 
-    # Enrich listings concurrently (batched to avoid hammering Redfin)
-    enriched = []
-    batch_size = 5
-    for i in range(0, len(all_listings), batch_size):
-        batch = all_listings[i:i + batch_size]
-        results = await asyncio.gather(*[enrich_listing(l) for l in batch])
-        enriched.extend(results)
-        if i + batch_size < len(all_listings):
-            await asyncio.sleep(0.5)
-
-    # Score and sort
-    for i, listing in enumerate(enriched):
+    # Score, sort by DOM, assign IDs
+    for i, listing in enumerate(all_listings):
         listing["id"] = i + 1
         listing["score"] = compute_score(listing, criteria)
         listing["addedDate"] = datetime.now().strftime("%Y-%m-%d")
 
-    enriched.sort(key=lambda l: l["score"], reverse=True)
+    all_listings.sort(key=lambda l: l["daysOnMarket"])
 
-    # Cache results
-    _listings_cache[cache_key] = (now, enriched)
-
-    # Clean old cache entries
+    # Cache
+    _listings_cache[cache_key] = (now, all_listings)
     expired = [k for k, (t, _) in _listings_cache.items() if now - t > CACHE_TTL]
     for k in expired:
         del _listings_cache[k]
 
-    return {"listings": enriched, "cached": False, "count": len(enriched)}
+    return {"listings": all_listings, "cached": False, "count": len(all_listings)}
+
+
+@app.post("/listings/search/{city}")
+async def search_city(city: str, criteria: SearchCriteria):
+    """Search a single city. Used for per-city streaming from the iOS app."""
+    if city not in REDFIN_CITIES:
+        raise HTTPException(400, f"Unknown city: {city}. Available: {list(REDFIN_CITIES.keys())}")
+
+    listings = await fetch_redfin_api(city, REDFIN_CITIES[city], criteria)
+    for i, listing in enumerate(listings):
+        listing["id"] = i + 1
+        listing["score"] = compute_score(listing, criteria)
+        listing["addedDate"] = datetime.now().strftime("%Y-%m-%d")
+
+    listings.sort(key=lambda l: l["daysOnMarket"])
+    return {"city": city, "listings": listings, "count": len(listings)}
 
 
 @app.get("/listings/open-houses")
@@ -721,16 +824,64 @@ async def get_vehicles(authorization: str = Header(...)):
     )
     if r.status_code != 200:
         raise HTTPException(r.status_code, r.text)
-    return r.json()
+    data = r.json()
+    # Log vehicle fields to debug option_codes/color availability
+    for v in data.get("response", []):
+        logger.info(f"Vehicle '{v.get('display_name')}': option_codes={v.get('option_codes', 'MISSING')}, color={v.get('color', 'MISSING')}, vin={v.get('vin', '?')}, keys={list(v.keys())}")
+    return data
 
 
 @app.post("/vehicles/{vehicle_id}/wake")
 async def wake_vehicle(vehicle_id: str, authorization: str = Header(...)):
+    """Wake vehicle and poll until online (up to ~30 seconds)."""
+    headers = {"Authorization": authorization}
+
+    # Send initial wake command
     r = await http.post(
-        f"{TESLA_BASE}/vehicles/{vehicle_id}/wake",
-        headers={"Authorization": authorization},
+        f"{TESLA_BASE}/vehicles/{vehicle_id}/wake_up",
+        headers=headers,
     )
-    return r.json()
+    logger.info(f"Wake request for {vehicle_id}: status={r.status_code}")
+
+    # If wake_up fails, try /wake endpoint
+    if r.status_code != 200:
+        r = await http.post(
+            f"{TESLA_BASE}/vehicles/{vehicle_id}/wake",
+            headers=headers,
+        )
+        logger.info(f"Wake fallback for {vehicle_id}: status={r.status_code}")
+
+    try:
+        data = r.json()
+        state = data.get("response", {}).get("state", "unknown")
+        logger.info(f"Wake initial state for {vehicle_id}: {state}")
+    except Exception as e:
+        logger.error(f"Wake parse error for {vehicle_id}: {e}, body={r.text[:200]}")
+        data = {"response": {"state": "unknown"}}
+        state = "unknown"
+
+    # Poll until online (max 6 attempts, ~30 seconds total)
+    for attempt in range(6):
+        if state == "online":
+            logger.info(f"Vehicle {vehicle_id} is online after {attempt} poll(s)")
+            return data
+        await asyncio.sleep(5)
+        try:
+            check = await http.get(
+                f"{TESLA_BASE}/vehicles/{vehicle_id}",
+                headers=headers,
+            )
+            if check.status_code == 200:
+                check_data = check.json()
+                state = check_data.get("response", {}).get("state", "unknown")
+                logger.info(f"Wake poll {attempt+1} for {vehicle_id}: state={state}")
+                if state == "online":
+                    return check_data
+        except Exception as e:
+            logger.error(f"Wake poll error for {vehicle_id}: {e}")
+
+    logger.warning(f"Vehicle {vehicle_id} did not come online after polling")
+    return data
 
 
 @app.post("/vehicles/{vehicle_id}/navigate")
@@ -739,13 +890,13 @@ async def send_navigation(vehicle_id: str, body: NavigateRequest,
     if not body.stops:
         raise HTTPException(400, "No stops provided")
 
-    destination = body.stops[-1]
-    waypoints = body.stops[:-1]
-
-    waypoints_str = "|".join(waypoints)
-    maps_url = f"https://maps.google.com/maps?daddr={urllib.parse.quote(destination)}"
-    if waypoints:
-        maps_url += f"&waypoints={urllib.parse.quote(waypoints_str)}"
+    # Build Google Maps multi-stop URL using /dir/ format
+    # Tesla's nav parses this into a multi-waypoint route
+    if len(body.stops) == 1:
+        maps_url = f"https://maps.google.com/maps?daddr={urllib.parse.quote(body.stops[0])}"
+    else:
+        parts = "/".join(urllib.parse.quote(s) for s in body.stops)
+        maps_url = f"https://www.google.com/maps/dir/{parts}"
 
     payload = {
         "type": "share_ext_content_raw",
@@ -756,16 +907,27 @@ async def send_navigation(vehicle_id: str, body: NavigateRequest,
         },
     }
 
-    r = await http.post(
-        f"{TESLA_BASE}/vehicles/{vehicle_id}/command/navigation_request",
-        json=payload,
-        headers={"Authorization": authorization, "Content-Type": "application/json"},
-    )
+    logger.info(f"Sending nav to vehicle {vehicle_id}: {maps_url}")
+
+    try:
+        r = await http.post(
+            f"{TESLA_BASE}/vehicles/{vehicle_id}/command/navigation_request",
+            json=payload,
+            headers={"Authorization": authorization, "Content-Type": "application/json"},
+        )
+    except Exception as e:
+        logger.error(f"Navigation request failed: {e}")
+        raise HTTPException(502, f"Failed to reach Tesla API: {e}")
 
     if r.status_code != 200:
+        logger.error(f"Tesla nav response {r.status_code}: {r.text[:500]}")
         raise HTTPException(r.status_code, r.text)
 
-    data = r.json()
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(502, "Tesla returned non-JSON response")
+
     if not data.get("response", {}).get("result"):
         reason = data.get("response", {}).get("reason", "Unknown")
         raise HTTPException(400, f"Tesla rejected command: {reason}")
@@ -778,28 +940,84 @@ async def send_navigation(vehicle_id: str, body: NavigateRequest,
 @app.get("/vehicles/{vehicle_id}/vehicle_data")
 async def get_vehicle_data(vehicle_id: str, authorization: str = Header(...)):
     """Proxy Tesla vehicle_data → flattened battery/climate/sentry status."""
-    r = await http.get(
-        f"{TESLA_BASE}/vehicles/{vehicle_id}/vehicle_data",
-        headers={"Authorization": authorization},
-        params={"endpoints": "charge_state;climate_state;vehicle_state;location_data"},
-    )
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, r.text)
+    try:
+        # Try Fleet API first
+        r = await http.get(
+            f"{TESLA_BASE}/vehicles/{vehicle_id}/vehicle_data",
+            headers={"Authorization": authorization},
+        )
+        logger.info(f"vehicle_data for {vehicle_id}: status={r.status_code}")
 
-    data = r.json().get("response", {})
-    charge = data.get("charge_state", {})
-    climate = data.get("climate_state", {})
-    vehicle = data.get("vehicle_state", {})
+        # If Fleet API returns 403 (virtual key not installed), try the data_request endpoint
+        if r.status_code == 403:
+            logger.info(f"Fleet API 403, trying data_request for {vehicle_id}")
+            r2 = await http.get(
+                f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/charge_state",
+                headers={"Authorization": authorization},
+            )
+            r3 = await http.get(
+                f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/climate_state",
+                headers={"Authorization": authorization},
+            )
+            r4 = await http.get(
+                f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/vehicle_state",
+                headers={"Authorization": authorization},
+            )
+            logger.info(f"data_request statuses: charge={r2.status_code}, climate={r3.status_code}, vehicle={r4.status_code}")
 
-    return {
-        "battery_level": charge.get("battery_level", 0),
-        "battery_range": charge.get("battery_range", 0),
-        "is_climate_on": climate.get("is_climate_on", False),
-        "interior_temp": climate.get("inside_temp"),
-        "exterior_temp": climate.get("outside_temp"),
-        "locked": vehicle.get("locked", True),
-        "sentry_mode": vehicle.get("sentry_mode", False),
-    }
+            charge = r2.json().get("response", {}) if r2.status_code == 200 else {}
+            climate = r3.json().get("response", {}) if r3.status_code == 200 else {}
+            vehicle = r4.json().get("response", {}) if r4.status_code == 200 else {}
+
+            # Try to get vehicle_config for exterior_color
+            r5 = await http.get(
+                f"{TESLA_BASE}/vehicles/{vehicle_id}/data_request/vehicle_config",
+                headers={"Authorization": authorization},
+            )
+            config = r5.json().get("response", {}) if r5.status_code == 200 else {}
+            logger.info(f"data_request vehicle_config for {vehicle_id}: status={r5.status_code}, color={config.get('exterior_color', 'N/A')}")
+
+            return {
+                "battery_level": charge.get("battery_level", 0),
+                "battery_range": charge.get("battery_range", 0),
+                "is_climate_on": climate.get("is_climate_on", False),
+                "interior_temp": climate.get("inside_temp"),
+                "exterior_temp": climate.get("outside_temp"),
+                "locked": vehicle.get("locked", True),
+                "sentry_mode": vehicle.get("sentry_mode", False),
+                "exterior_color": config.get("exterior_color"),
+                "paint_color": config.get("paint_color"),
+            }
+
+        if r.status_code != 200:
+            logger.error(f"vehicle_data error body: {r.text[:500]}")
+            raise HTTPException(r.status_code, r.text)
+
+        data = r.json().get("response", {})
+        if not data:
+            raise HTTPException(404, "No vehicle data returned")
+
+        charge = data.get("charge_state") or {}
+        climate = data.get("climate_state") or {}
+        vehicle = data.get("vehicle_state") or {}
+        config = data.get("vehicle_config") or {}
+
+        return {
+            "battery_level": charge.get("battery_level", 0),
+            "battery_range": charge.get("battery_range", 0),
+            "is_climate_on": climate.get("is_climate_on", False),
+            "interior_temp": climate.get("inside_temp"),
+            "exterior_temp": climate.get("outside_temp"),
+            "locked": vehicle.get("locked", True),
+            "sentry_mode": vehicle.get("sentry_mode", False),
+            "exterior_color": config.get("exterior_color"),
+            "paint_color": config.get("paint_color"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"vehicle_data error for {vehicle_id}: {e}")
+        raise HTTPException(502, f"Failed to get vehicle data: {e}")
 
 
 @app.post("/vehicles/{vehicle_id}/command/climate")
@@ -807,15 +1025,17 @@ async def set_climate(vehicle_id: str, body: ClimateRequest,
                       authorization: str = Header(...)):
     """Start/stop climate and optionally set temperature."""
     headers = {"Authorization": authorization, "Content-Type": "application/json"}
+    logger.info(f"Climate command for {vehicle_id}: on={body.on}, temp_c={body.temp_c}")
 
     if body.on:
         # Set temperature first if provided
         if body.temp_c is not None:
-            await http.post(
+            tr = await http.post(
                 f"{TESLA_BASE}/vehicles/{vehicle_id}/command/set_temps",
                 json={"driver_temp": body.temp_c, "passenger_temp": body.temp_c},
                 headers=headers,
             )
+            logger.info(f"set_temps response: {tr.status_code} {tr.text[:200]}")
         r = await http.post(
             f"{TESLA_BASE}/vehicles/{vehicle_id}/command/auto_conditioning_start",
             headers=headers,
@@ -826,9 +1046,15 @@ async def set_climate(vehicle_id: str, body: ClimateRequest,
             headers=headers,
         )
 
+    logger.info(f"Climate response: {r.status_code} {r.text[:500]}")
+    if r.status_code == 403:
+        raise HTTPException(403, f"Tesla rejected climate command (403). The vehicle may need the app's virtual key installed. Details: {r.text[:300]}")
     if r.status_code != 200:
         raise HTTPException(r.status_code, r.text)
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(502, f"Tesla returned non-JSON: {r.text[:200]}")
 
 
 @app.post("/route/optimize-order")

@@ -64,22 +64,14 @@ class TeslaService: ObservableObject {
     // MARK: - Wake Vehicle
 
     func wakeVehicle(_ vehicleId: String) async throws {
-        let req = request(path: "/vehicles/\(vehicleId)/wake", method: "POST")
+        var req = request(path: "/vehicles/\(vehicleId)/wake", method: "POST")
+        req.timeoutInterval = 45 // wake polling can take up to 30s on backend
         let (data, resp) = try await Self.session.data(for: req)
 
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             let msg = String(data: data, encoding: .utf8) ?? "Wake failed"
             throw TeslaError.commandFailed(msg)
         }
-
-        // Check if already online, otherwise wait for wake
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let response = json["response"] as? [String: Any],
-           let state = response["state"] as? String,
-           state == "online" {
-            return
-        }
-        try await Task.sleep(nanoseconds: 3_000_000_000)
     }
 
     // MARK: - Send Navigation
@@ -104,16 +96,27 @@ class TeslaService: ObservableObject {
         do {
             let req = request(path: "/vehicles/\(vehicleId)/vehicle_data")
             let (data, resp) = try await Self.session.data(for: req)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
-            let status = try JSONDecoder().decode(VehicleStatusData.self, from: data)
-            if let id = Int(vehicleId) {
-                vehicleStatus[id] = status
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+
+            // Vehicle might be asleep (408) — try waking it
+            if code == 408 {
+                try? await wakeVehicle(vehicleId)
+                let retryReq = request(path: "/vehicles/\(vehicleId)/vehicle_data")
+                let (retryData, retryResp) = try await Self.session.data(for: retryReq)
+                guard (retryResp as? HTTPURLResponse)?.statusCode == 200 else { return }
+                let status = try JSONDecoder().decode(VehicleStatusData.self, from: retryData)
+                if let id = Int(vehicleId) { vehicleStatus[id] = status }
+                return
             }
-        } catch { /* silently fail — status is optional */ }
+
+            guard code == 200 else { return }
+            let status = try JSONDecoder().decode(VehicleStatusData.self, from: data)
+            if let id = Int(vehicleId) { vehicleStatus[id] = status }
+        } catch { /* status is optional */ }
     }
 
     func loadAllVehicleData() async {
-        for vehicle in vehicles where vehicle.isOnline {
+        for vehicle in vehicles {
             await loadVehicleData(vehicle.idString)
         }
     }

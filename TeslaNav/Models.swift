@@ -106,17 +106,18 @@ struct TeslaVehicle: Identifiable, Codable {
     let displayName: String
     let vin: String
     let state: String  // "online", "asleep", "offline"
+    let optionCodes: String?
 
     enum CodingKeys: String, CodingKey {
         case id
         case displayName = "display_name"
         case vin
         case state
+        case optionCodes = "option_codes"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        // id can be Int or large number
         if let intId = try? c.decode(Int.self, forKey: .id) {
             self.id = intId
         } else if let strId = try? c.decode(String.self, forKey: .id), let parsed = Int(strId) {
@@ -127,10 +128,37 @@ struct TeslaVehicle: Identifiable, Codable {
         self.displayName = (try? c.decode(String.self, forKey: .displayName)) ?? "Tesla"
         self.vin = (try? c.decode(String.self, forKey: .vin)) ?? ""
         self.state = (try? c.decode(String.self, forKey: .state)) ?? "offline"
+        self.optionCodes = try? c.decode(String.self, forKey: .optionCodes)
     }
 
     var isOnline: Bool { state == "online" }
     var idString: String { String(id) }
+
+    /// Model code derived from VIN (position 4)
+    var modelCode: String {
+        guard vin.count >= 4 else { return "m3" }
+        let ch = vin[vin.index(vin.startIndex, offsetBy: 3)]
+        switch ch {
+        case "S", "s": return "ms"
+        case "X", "x": return "mx"
+        case "3": return "m3"
+        case "Y", "y": return "my"
+        default: return "m3"
+        }
+    }
+
+    /// Tesla compositor URL for the exact vehicle image (model, color, wheels)
+    func imageURL(paintCode: String? = nil) -> URL? {
+        if let codes = optionCodes, !codes.isEmpty {
+            let urlStr = "https://static-assets.tesla.com/configurator/compositor?model=\(modelCode)&view=STUD_3QTR&size=400&options=\(codes)&bkba_opt=1"
+            return URL(string: urlStr)
+        }
+        // Use paint code from vehicle status, or default
+        let paint = paintCode ?? "PMNG"
+        let wheels = modelCode == "my" ? "W40B" : "W38B"
+        let urlStr = "https://static-assets.tesla.com/configurator/compositor?model=\(modelCode)&view=STUD_3QTR&size=400&options=\(paint),\(wheels),IBB1&bkba_opt=1"
+        return URL(string: urlStr)
+    }
 }
 
 struct TeslaVehiclesResponse: Codable {
@@ -176,6 +204,8 @@ struct VehicleStatusData: Codable {
     var exteriorTemp: Double?   // celsius
     var locked: Bool
     var sentryMode: Bool
+    var exteriorColor: String?  // e.g. "Red", "Blue", "White"
+    var paintColor: String?     // paint code if available
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -186,6 +216,8 @@ struct VehicleStatusData: Codable {
         exteriorTemp = try? c.decode(Double.self, forKey: .exteriorTemp)
         locked = (try? c.decode(Bool.self, forKey: .locked)) ?? true
         sentryMode = (try? c.decode(Bool.self, forKey: .sentryMode)) ?? false
+        exteriorColor = try? c.decode(String.self, forKey: .exteriorColor)
+        paintColor = try? c.decode(String.self, forKey: .paintColor)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -196,6 +228,26 @@ struct VehicleStatusData: Codable {
         case exteriorTemp = "exterior_temp"
         case locked
         case sentryMode = "sentry_mode"
+        case exteriorColor = "exterior_color"
+        case paintColor = "paint_color"
+    }
+
+    /// Map exterior color name to Tesla compositor paint option code
+    var paintOptionCode: String? {
+        if let pc = paintColor, !pc.isEmpty { return pc }
+        guard let color = exteriorColor?.lowercased() else { return nil }
+        switch color {
+        case let c where c.contains("red"): return "PPMR"
+        case let c where c.contains("blue"): return "PPSB"
+        case let c where c.contains("white"): return "PPSW"
+        case let c where c.contains("black"): return "PBSB"
+        case let c where c.contains("silver"), let c where c.contains("midnight"): return "PMNG"
+        case let c where c.contains("gray"), let c where c.contains("grey"): return "PMNG"
+        case let c where c.contains("pearl"): return "PPSW"
+        case let c where c.contains("quicksilver"): return "PQS0"
+        case let c where c.contains("ultra white"): return "PU01"
+        default: return nil
+        }
     }
 }
 

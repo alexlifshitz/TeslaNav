@@ -176,35 +176,63 @@ class RouteViewModel: ObservableObject {
 
     // MARK: - Climate Control
 
-    func activateClimate(tesla: TeslaService, weather: WeatherService) async {
+    /// Pick a comfortable cabin target based on the car's interior temp.
+    private func suggestedTempC(interiorC: Double?) -> Double {
+        guard let inside = interiorC else { return 21.0 }
+        if inside < 5 { return 23.0 }       // freezing cabin → heat up
+        if inside < 15 { return 22.0 }       // cold cabin → warm
+        if inside < 20 { return 21.0 }       // cool cabin → mild
+        if inside >= 20, inside <= 24 { return 21.0 } // already comfortable
+        if inside < 32 { return 20.0 }       // warm cabin → cool down
+        return 19.0                           // hot cabin → max cool
+    }
+
+    func activateClimate(tesla: TeslaService) async {
         guard !selectedVehicleIds.isEmpty else { return }
         isClimateActivating = true
         climateStatus = nil
-
-        let tempC = weather.suggestedCabinTempC
-        let tempF = Int(weather.celsiusToFahrenheit(tempC))
         var successes = 0
+        var statusMessages: [String] = []
 
+        var lastError: String?
         for vehicleId in selectedVehicleIds {
             let idStr = String(vehicleId)
             do {
-                let vehicle = tesla.vehicles.first { $0.id == vehicleId }
-                if vehicle?.isOnline == false {
-                    try await tesla.wakeVehicle(idStr)
+                // Wake first — backend polls until online (up to ~30s)
+                try await tesla.wakeVehicle(idStr)
+
+                // Refresh vehicle data to get current interior temp
+                await tesla.loadVehicleData(idStr)
+                let status = tesla.vehicleStatus[vehicleId]
+                let interiorC = status?.interiorTemp
+                let tempC = suggestedTempC(interiorC: interiorC)
+                let tempF = Int(tempC * 9.0 / 5.0 + 32.0)
+
+                // Skip if cabin is already comfortable (19-24°C)
+                if let inside = interiorC, inside >= 19, inside <= 24 {
+                    let insideF = Int(inside * 9.0 / 5.0 + 32.0)
+                    statusMessages.append("Already \(insideF)°F — no action needed")
+                    successes += 1
+                    continue
                 }
+
                 try await tesla.setClimate(idStr, on: true, tempC: tempC)
                 successes += 1
-            } catch { /* continue to next vehicle */ }
+                if let inside = interiorC {
+                    let insideF = Int(inside * 9.0 / 5.0 + 32.0)
+                    statusMessages.append("Cabin \(insideF)°F → setting to \(tempF)°F")
+                } else {
+                    statusMessages.append("Climate on → \(tempF)°F")
+                }
+            } catch {
+                lastError = "Vehicle \(idStr): \(error.localizedDescription)"
+            }
         }
 
         if successes > 0 {
-            if let outsideF = weather.currentTempF {
-                climateStatus = "Climate on → \(tempF)°F (outside: \(Int(outsideF))°F)"
-            } else {
-                climateStatus = "Climate on → \(tempF)°F"
-            }
+            climateStatus = statusMessages.joined(separator: " | ")
         } else {
-            climateStatus = "Failed to start climate"
+            climateStatus = "Climate failed: \(lastError ?? "unknown error")"
         }
         isClimateActivating = false
     }

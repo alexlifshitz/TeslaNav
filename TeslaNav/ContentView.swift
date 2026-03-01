@@ -603,7 +603,7 @@ struct VehicleSendSection: View {
 
                 // Pre-condition climate
                 if !vm.selectedVehicleIds.isEmpty {
-                    Button(action: { Task { await vm.activateClimate(tesla: tesla, weather: weather) } }) {
+                    Button(action: { Task { await vm.activateClimate(tesla: tesla) } }) {
                         HStack(spacing: 8) {
                             if vm.isClimateActivating {
                                 ProgressView().tint(.cyan).scaleEffect(0.8)
@@ -675,26 +675,41 @@ struct VehicleToggleRow: View {
     var body: some View {
         Button(action: onToggle) {
             HStack(spacing: 12) {
-                Image(systemName: "car.side.fill")
-                    .font(.system(size: 22))
-                    .foregroundColor(isSelected ? .yellow : .gray)
-                    .frame(width: 36)
+                Group {
+                    if let url = vehicle.imageURL(paintCode: status?.paintOptionCode) {
+                        AsyncImage(url: url) { phase in
+                            switch phase {
+                            case .success(let image):
+                                image.resizable().scaledToFit()
+                            default:
+                                Image(systemName: "car.side.fill")
+                                    .font(.system(size: 28))
+                                    .foregroundColor(isSelected ? .yellow : .gray)
+                            }
+                        }
+                    } else {
+                        Image(systemName: "car.side.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(isSelected ? .yellow : .gray)
+                    }
+                }
+                .frame(width: 100, height: 60)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(vehicle.displayName)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.white)
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
+                        Text(vehicle.displayName)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
                         Circle()
                             .fill(vehicle.isOnline ? Color.green : Color.gray.opacity(0.5))
                             .frame(width: 7, height: 7)
                         Text(vehicle.state.capitalized)
                             .font(.system(size: 11))
                             .foregroundColor(.gray)
-
-                        if let s = status {
-                            Text("·")
-                                .foregroundColor(.gray)
+                    }
+                    if let s = status {
+                        HStack(spacing: 5) {
                             Image(systemName: batteryIcon(s.batteryLevel))
                                 .font(.system(size: 10))
                                 .foregroundColor(batteryColor(s.batteryLevel))
@@ -704,6 +719,16 @@ struct VehicleToggleRow: View {
                             Text("\(Int(s.batteryRange)) mi")
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.gray)
+                            if let cabin = s.interiorTemp {
+                                Text("·")
+                                    .foregroundColor(.gray)
+                                Image(systemName: "thermometer.medium")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.orange)
+                                Text("\(Int(cabin * 9.0 / 5.0 + 32.0))°F")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.orange)
+                            }
                         }
                     }
                 }

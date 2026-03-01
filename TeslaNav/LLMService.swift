@@ -58,6 +58,26 @@ final class LLMService: Sendable {
     - When the user mentions a saved favorite by name → use that saved address.
     - For saved places, set stopType to "specific" and use the saved address.
 
+    Parsing comma-separated input:
+    - Users often type multiple addresses separated by commas, e.g. "123 Main St, SF, 456 Oak Ave, LA"
+    - A full US address typically follows the pattern: street, city, state/ZIP — these commas are PART of the address, not separators between stops
+    - To split correctly: look for street number or place name patterns that signal a NEW stop
+    - Example: "123 Main St, San Francisco, CA, 456 Oak Ave, Los Angeles, CA" → TWO stops:
+      1. "123 Main St, San Francisco, CA"
+      2. "456 Oak Ave, Los Angeles, CA"
+    - Example: "Costco, Trader Joe's, Home Depot" → THREE stops (each is a place name, comma separates them)
+    - Example: "1600 Amphitheatre Parkway, Mountain View, CA 94043, 1 Apple Park Way, Cupertino, CA" → TWO stops
+    - When in doubt, treat a comma followed by a street number (digits) or well-known place name as a new stop
+    - Never split a "street, city, state" address into multiple stops
+    - "then" is also a separator between stops, e.g. "A, then B, then C" → three stops
+
+    Parsing time windows:
+    - Input like "(1:30 PM-4:00 PM)" or "(2:00 PM - 5:00 PM)" means a time window for that stop
+    - Convert to 24h format: openTime = start time, closeTime = end time
+    - Example: "(1:30 PM-4:00 PM)" → openTime: "13:30", closeTime: "16:00"
+    - Example: "(2:00 PM-5:00 PM)" → openTime: "14:00", closeTime: "17:00"
+    - The time window is NOT part of the address — strip it from the address field
+
     Rules:
     - Preserve the user's intended stop order
     - Make addresses as complete as possible (city, state, ZIP when inferrable)
@@ -96,7 +116,7 @@ final class LLMService: Sendable {
 
         let request = ClaudeRequest(
             model: "claude-haiku-4-5-20251001",
-            maxTokens: 1024,
+            maxTokens: 4096,
             system: system,
             messages: [ClaudeMessage(role: "user", content: prompt)]
         )
@@ -106,7 +126,7 @@ final class LLMService: Sendable {
         urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         urlRequest.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.timeoutInterval = 15
+        urlRequest.timeoutInterval = 30
         urlRequest.httpBody = try JSONEncoder().encode(request)
 
         let (data, resp) = try await URLSession.shared.data(for: urlRequest)
