@@ -9,8 +9,9 @@ Run:     uvicorn main:app --reload --port 8000
 import os, re, json, time, asyncio, urllib.parse, logging, traceback, csv, io, math
 from typing import Optional
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File, Form
+from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -33,6 +34,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Reports directory for generated tour reports
+REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+os.makedirs(REPORTS_DIR, exist_ok=True)
+app.mount("/report-media", StaticFiles(directory=REPORTS_DIR), name="report-media")
 
 TESLA_BASE = "https://fleet-api.prd.na.vn.cloud.tesla.com/api/1"
 TESLA_AUTH_BASE = "https://auth.tesla.com/oauth2/v3"
@@ -719,6 +725,14 @@ async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCrit
                     list_price = int(lp_obj) if lp_obj else int(price)
                 price = list_price
 
+            # Coordinates
+            ll = h.get("latLong", {})
+            if isinstance(ll, dict):
+                home_lat = ll.get("value", {}).get("latitude") if isinstance(ll.get("value"), dict) else ll.get("latitude")
+                home_lng = ll.get("value", {}).get("longitude") if isinstance(ll.get("value"), dict) else ll.get("longitude")
+            else:
+                home_lat, home_lng = None, None
+
             listing = {
                 "address": address,
                 "city": city_val,
@@ -741,6 +755,8 @@ async def fetch_redfin_api(city_name: str, city_info: dict, criteria: SearchCrit
                 "soldPrice": sold_price,
                 "soldDate": sold_date,
                 "listingStatus": criteria.listingStatus,
+                "latitude": float(home_lat) if home_lat else None,
+                "longitude": float(home_lng) if home_lng else None,
             }
             listings.append(listing)
 
@@ -1493,6 +1509,20 @@ async def check_if_sold(request: dict):
         status_match = re.search(r'longerDefinitionToken\\?"\\?:\s*\\?"(active|sold|pending|contingent)\\?"', text)
         page_status = status_match.group(1) if status_match else "unknown"
 
+        # Detect remodel from page text
+        lower = text.lower()
+        remodeled = any(kw in lower for kw in REMODEL_KW)
+        remodel_year = None
+        if remodeled:
+            yr = re.search(r'(?:remodel|renovate|update)(?:ed|d)?\s+(?:in\s+)?(\d{4})', lower)
+            if yr:
+                remodel_year = int(yr.group(1))
+        # Extract description
+        notes = None
+        desc_match = re.search(r'"text"\s*:\s*"([^"]{50,500})"', text)
+        if desc_match:
+            notes = desc_match.group(1)[:300].replace("\\n", " ").strip()
+
         if page_status == "sold":
             listing = {"listingStatus": "recently_sold", "price": 0, "soldPrice": None, "soldDate": None}
             _extract_prices_from_page(listing, text)
@@ -1502,11 +1532,15 @@ async def check_if_sold(request: dict):
                 "soldDate": listing.get("soldDate"),
                 "listPrice": listing.get("price") if listing.get("price", 0) > 0 else None,
                 "status": "recently_sold",
+                "remodeled": remodeled,
+                "remodelYear": remodel_year,
+                "notes": notes,
                 "url": url,
             }
         else:
             status = "pending" if page_status in ("pending", "contingent") else "for_sale"
-            return {"sold": False, "soldPrice": None, "soldDate": None, "listPrice": None, "status": status, "url": url}
+            return {"sold": False, "soldPrice": None, "soldDate": None, "listPrice": None, "status": status,
+                    "remodeled": remodeled, "remodelYear": remodel_year, "notes": notes, "url": url}
     except Exception as e:
         logger.error(f"check_if_sold error: {e}")
         return {"sold": False, "soldPrice": None, "soldDate": None, "listPrice": None, "status": "for_sale", "error": str(e)}
@@ -1919,6 +1953,204 @@ async def tesla_public_key():
     from fastapi.responses import FileResponse
     key_path = os.path.join(os.path.dirname(__file__), ".well-known", "appspecific", "com.tesla.3p.public-key.pem")
     return FileResponse(key_path, media_type="application/x-pem-file")
+
+
+# ─── Tour Report Endpoints ───────────────────────────────────────────────────
+
+@app.post("/reports/generate")
+async def generate_report(
+    request: Request,
+    metadata: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+):
+    """Generate an HTML tour report from stop metadata and media files."""
+    import uuid as _uuid
+    report_id = str(_uuid.uuid4())[:8]
+    report_dir = os.path.join(REPORTS_DIR, report_id)
+    os.makedirs(report_dir, exist_ok=True)
+
+    # Parse metadata
+    try:
+        stops = json.loads(metadata)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid metadata JSON")
+
+    # Save uploaded files
+    file_map = {}
+    for f in files:
+        content = await f.read()
+        safe_name = f.filename.replace("/", "_").replace("\\", "_")
+        fpath = os.path.join(report_dir, safe_name)
+        with open(fpath, "wb") as out:
+            out.write(content)
+        file_map[safe_name] = safe_name
+
+    # Generate HTML
+    html = _build_report_html(stops, report_id)
+    with open(os.path.join(report_dir, "index.html"), "w") as f:
+        f.write(html)
+
+    # Build URL
+    base_url = str(request.base_url).rstrip("/")
+    report_url = f"{base_url}/report-media/{report_id}/index.html"
+
+    return {"url": report_url, "reportId": report_id}
+
+
+@app.get("/reports/{report_id}")
+async def get_report(report_id: str):
+    """Convenience redirect to the report HTML."""
+    return RedirectResponse(url=f"/report-media/{report_id}/index.html")
+
+
+def _build_report_html(stops: list[dict], report_id: str) -> str:
+    """Build a self-contained HTML report page."""
+    today = datetime.now().strftime("%B %d, %Y")
+
+    liked = sum(1 for s in stops if s.get("feedback") == "liked")
+    disliked = sum(1 for s in stops if s.get("feedback") == "disliked")
+    visited = sum(1 for s in stops if s.get("feedback") in ("visited", "liked", "disliked"))
+    total = len(stops)
+
+    cards_html = ""
+    for i, stop in enumerate(stops):
+        fb = stop.get("feedback", "not_visited")
+        fb_label = {"liked": "Liked", "disliked": "Disliked", "visited": "Visited", "not_visited": "Skipped"}.get(fb, fb)
+        fb_color = {"liked": "#22c55e", "disliked": "#ef4444", "visited": "#3b82f6", "not_visited": "#6b7280"}.get(fb, "#6b7280")
+        fb_icon = {"liked": "&#128077;", "disliked": "&#128078;", "visited": "&#10003;", "not_visited": "&#8212;"}.get(fb, "")
+
+        price = stop.get("price", 0)
+        if price >= 1_000_000:
+            price_fmt = f"${price/1_000_000:.2f}M" if price % 100_000 != 0 else f"${price/1_000_000:.1f}M"
+        else:
+            price_fmt = f"${price:,}"
+
+        sold_html = ""
+        if stop.get("soldPrice"):
+            sp = stop["soldPrice"]
+            sp_fmt = f"${sp/1_000_000:.2f}M" if sp >= 1_000_000 else f"${sp:,}"
+            sold_html = f'<span style="color:#ef4444;margin-left:8px">Sold: {sp_fmt}</span>'
+
+        details = []
+        if stop.get("bedrooms"): details.append(f'{stop["bedrooms"]} bed')
+        if stop.get("bathrooms"): details.append(f'{stop["bathrooms"]} bath')
+        if stop.get("sqft"): details.append(f'{stop["sqft"]:,} sqft')
+        if stop.get("lotSqft"): details.append(f'{stop["lotSqft"]:,} lot')
+        if stop.get("yearBuilt"): details.append(f'Built {stop["yearBuilt"]}')
+        details_str = " &middot; ".join(details)
+
+        remodel_html = ""
+        if stop.get("remodeled"):
+            ry = f' ({stop["remodelYear"]})' if stop.get("remodelYear") else ""
+            remodel_html = f'<span class="tag tag-green">Remodeled{ry}</span>'
+        else:
+            remodel_html = '<span class="tag tag-yellow">Not Remodeled</span>'
+
+        oh_html = ""
+        if stop.get("openTime") and stop.get("closeTime"):
+            oh_html = f'<div class="oh-time">&#128340; {stop["openTime"]} - {stop["closeTime"]}</div>'
+
+        score = stop.get("score", 0)
+        if score >= 85: sc_color = "#22c55e"
+        elif score >= 65: sc_color = "#eab308"
+        elif score >= 45: sc_color = "#f97316"
+        else: sc_color = "#ef4444"
+
+        notes_html = ""
+        if stop.get("notes", "").strip():
+            escaped_notes = stop["notes"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+            notes_html = f'<div class="notes"><strong>Notes:</strong> {escaped_notes}</div>'
+
+        # User photos/videos
+        media_html = ""
+        media_files = stop.get("mediaFiles", [])
+        if media_files:
+            media_items = ""
+            for mf in media_files:
+                safe = mf.replace("/", "_").replace("\\", "_")
+                if any(mf.lower().endswith(ext) for ext in [".mov", ".mp4", ".m4v"]):
+                    media_items += f'<video src="{safe}" controls class="media-item"></video>'
+                else:
+                    media_items += f'<img src="{safe}" class="media-item" loading="lazy">'
+            media_html = f'<div class="media-grid">{media_items}</div>'
+
+        image_url = stop.get("imageUrl", "")
+        listing_url = stop.get("url", "")
+
+        cards_html += f'''
+        <div class="card">
+            <div class="card-header">
+                <span class="fb-badge" style="background:{fb_color}20;color:{fb_color};border:1px solid {fb_color}40">
+                    {fb_icon} {fb_label}
+                </span>
+                <span class="score" style="border-color:{sc_color};color:{sc_color}">{score}</span>
+            </div>
+            {"<img src='" + image_url + "' class='listing-img' loading='lazy'>" if image_url else ""}
+            <div class="card-body">
+                <h3>{stop.get("address", "Unknown")}</h3>
+                <div class="city">{stop.get("city", "")} &middot; {price_fmt}{sold_html}</div>
+                <div class="details">{details_str}</div>
+                {remodel_html}
+                {oh_html}
+                {notes_html}
+                {media_html}
+                {"<a href='" + listing_url + "' target='_blank' class='listing-link'>View on Redfin &rarr;</a>" if listing_url else ""}
+            </div>
+        </div>
+        '''
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Open House Tour Report</title>
+<style>
+    * {{ margin:0; padding:0; box-sizing:border-box; }}
+    body {{ background:#0a0a0a; color:#e5e5e5; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:16px; max-width:800px; margin:0 auto; }}
+    .header {{ text-align:center; padding:24px 0; border-bottom:1px solid #222; margin-bottom:24px; }}
+    .header h1 {{ font-size:24px; color:#fff; margin-bottom:4px; }}
+    .header .date {{ color:#888; font-size:14px; }}
+    .summary {{ display:flex; gap:12px; justify-content:center; margin-bottom:24px; flex-wrap:wrap; }}
+    .summary .stat {{ background:#111; padding:8px 16px; border-radius:8px; text-align:center; }}
+    .summary .stat .num {{ font-size:20px; font-weight:bold; }}
+    .summary .stat .label {{ font-size:11px; color:#888; text-transform:uppercase; }}
+    .card {{ background:#111; border-radius:12px; overflow:hidden; margin-bottom:16px; }}
+    .card-header {{ display:flex; justify-content:space-between; align-items:center; padding:12px 16px; }}
+    .fb-badge {{ padding:4px 10px; border-radius:6px; font-size:12px; font-weight:600; }}
+    .score {{ width:36px; height:36px; border-radius:50%; border:2px solid; display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:bold; }}
+    .listing-img {{ width:100%; height:200px; object-fit:cover; }}
+    .card-body {{ padding:16px; }}
+    .card-body h3 {{ font-size:16px; color:#fff; margin-bottom:4px; }}
+    .city {{ color:#aaa; font-size:13px; margin-bottom:6px; }}
+    .details {{ color:#888; font-size:12px; margin-bottom:8px; }}
+    .tag {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; margin-bottom:8px; }}
+    .tag-green {{ background:#22c55e20; color:#22c55e; }}
+    .tag-yellow {{ background:#eab30820; color:#eab308; }}
+    .oh-time {{ color:#eab308; font-size:12px; margin-bottom:8px; }}
+    .notes {{ background:#1a1a1a; padding:10px; border-radius:6px; font-size:13px; color:#ccc; margin:8px 0; border-left:3px solid #eab308; }}
+    .media-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin:8px 0; }}
+    .media-item {{ width:100%; height:120px; object-fit:cover; border-radius:6px; background:#222; }}
+    .listing-link {{ display:inline-block; color:#3b82f6; font-size:13px; margin-top:8px; text-decoration:none; }}
+    .listing-link:hover {{ text-decoration:underline; }}
+    .footer {{ text-align:center; padding:24px 0; color:#555; font-size:12px; border-top:1px solid #222; margin-top:12px; }}
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>Open House Tour Report</h1>
+    <div class="date">{today}</div>
+</div>
+<div class="summary">
+    <div class="stat"><div class="num">{total}</div><div class="label">Properties</div></div>
+    <div class="stat"><div class="num" style="color:#22c55e">{liked}</div><div class="label">Liked</div></div>
+    <div class="stat"><div class="num" style="color:#ef4444">{disliked}</div><div class="label">Disliked</div></div>
+    <div class="stat"><div class="num" style="color:#3b82f6">{visited}</div><div class="label">Visited</div></div>
+</div>
+{cards_html}
+<div class="footer">Generated by OpenHouse App</div>
+</body>
+</html>'''
 
 
 @app.get("/health")
