@@ -19,6 +19,8 @@
 		A1B2C3D4E5F60001000023AA /* CalendarService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60001000024AA /* CalendarService.swift */; };
 		A1B2C3D4E5F60001000025AA /* ContactsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60001000026AA /* ContactsService.swift */; };
 		A1B2C3D4E5F60001000027AA /* WeatherService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60001000028AA /* WeatherService.swift */; };
+		A1B2C3D4E5F60001000029AA /* LocationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60001000030AA /* LocationService.swift */; };
+		A1B2C3D4E5F60001000031AA /* RouteMapView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60001000032AA /* RouteMapView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +38,8 @@
 		A1B2C3D4E5F60001000024AA /* CalendarService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarService.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60001000026AA /* ContactsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactsService.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60001000028AA /* WeatherService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WeatherService.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60001000030AA /* LocationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationService.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60001000032AA /* RouteMapView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RouteMapView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -70,7 +74,9 @@
 				A1B2C3D4E5F60001000024AA /* CalendarService.swift */,
 				A1B2C3D4E5F60001000026AA /* ContactsService.swift */,
 				A1B2C3D4E5F60001000028AA /* WeatherService.swift */,
+				A1B2C3D4E5F60001000030AA /* LocationService.swift */,
 				A1B2C3D4E5F60001000010AA /* SettingsView.swift */,
+				A1B2C3D4E5F60001000032AA /* RouteMapView.swift */,
 				A1B2C3D4E5F60001000012AA /* Assets.xcassets */,
 				A1B2C3D4E5F60001000014AA /* Info.plist */,
 			);
@@ -165,6 +171,8 @@
 				A1B2C3D4E5F60001000023AA /* CalendarService.swift in Sources */,
 				A1B2C3D4E5F60001000025AA /* ContactsService.swift in Sources */,
 				A1B2C3D4E5F60001000027AA /* WeatherService.swift in Sources */,
+				A1B2C3D4E5F60001000029AA /* LocationService.swift in Sources */,
+				A1B2C3D4E5F60001000031AA /* RouteMapView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

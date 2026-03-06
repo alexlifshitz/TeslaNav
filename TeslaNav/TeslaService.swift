@@ -4,6 +4,7 @@ struct ResolvedRoute {
     let stops: [RouteStop]
     let totalDriveMin: Int?
     let totalDistanceKm: Double?
+    let encodedPolyline: String?
 }
 
 @MainActor
@@ -94,10 +95,26 @@ class TeslaService: ObservableObject {
 
     // MARK: - Send Navigation
 
-    func sendRoute(_ stops: [RouteStop], to vehicleId: String) async throws {
+    /// Send all stops to Tesla as waypoints via signed GPS commands.
+    /// Falls back to single navigation_request if signed commands unavailable.
+    func sendRoute(_ stops: [RouteStop], to vehicleId: String, vin: String? = nil) async throws {
         guard !stops.isEmpty else { return }
 
-        let body = ["stops": stops.map { $0.address }]
+        struct Waypoint: Codable {
+            let address: String
+            let latitude: Double?
+            let longitude: Double?
+            let order: Int
+        }
+        struct WaypointBody: Codable {
+            let waypoints: [Waypoint]
+            let vin: String?
+        }
+
+        let waypoints = stops.enumerated().map { idx, stop in
+            Waypoint(address: stop.address, latitude: stop.latitude, longitude: stop.longitude, order: idx)
+        }
+        let body = WaypointBody(waypoints: waypoints, vin: vin)
         let bodyData = try JSONEncoder().encode(body)
         let req = request(path: "/vehicles/\(vehicleId)/navigate", method: "POST", body: bodyData)
 
@@ -195,10 +212,12 @@ class TeslaService: ObservableObject {
         struct DirectionsInfo: Codable {
             let totalDurationMin: Int?
             let totalDistanceKm: Double?
+            let encodedPolyline: String?
 
             enum CodingKeys: String, CodingKey {
                 case totalDurationMin = "total_duration_min"
                 case totalDistanceKm = "total_distance_km"
+                case encodedPolyline = "encoded_polyline"
             }
         }
         struct RouteResponse: Codable {
@@ -210,7 +229,8 @@ class TeslaService: ObservableObject {
         return ResolvedRoute(
             stops: result.stops,
             totalDriveMin: result.directions?.totalDurationMin,
-            totalDistanceKm: result.directions?.totalDistanceKm
+            totalDistanceKm: result.directions?.totalDistanceKm,
+            encodedPolyline: result.directions?.encodedPolyline
         )
     }
 

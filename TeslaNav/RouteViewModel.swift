@@ -21,6 +21,7 @@ class RouteViewModel: ObservableObject {
     @Published var isResolving = false
     @Published var totalDistanceKm: Double? = nil
     @Published var rangeWarning: String? = nil
+    @Published var encodedPolyline: String? = nil
     @Published var isClimateActivating = false
     @Published var climateStatus: String? = nil
 
@@ -30,7 +31,8 @@ class RouteViewModel: ObservableObject {
 
     func parseAndOptimize(
         calendarEvents: [CalendarEvent] = [],
-        contactAddresses: [ContactAddress] = []
+        contactAddresses: [ContactAddress] = [],
+        currentLocation: String? = nil
     ) async {
         guard !promptText.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         isOptimizing = true
@@ -39,6 +41,7 @@ class RouteViewModel: ObservableObject {
         preferences = nil
         totalDriveMin = nil
         totalDistanceKm = nil
+        encodedPolyline = nil
         rangeWarning = nil
         sendStatus = [:]
 
@@ -49,7 +52,6 @@ class RouteViewModel: ObservableObject {
             let saved = settings.allSavedLocations.map { (name: $0.name, address: $0.address) }
             let parsed = try await llm.parsePrompt(
                 promptText,
-                apiKey: settings.claudeApiKey,
                 savedLocations: saved,
                 calendarEvents: calendarEvents,
                 contactAddresses: contactAddresses
@@ -78,14 +80,19 @@ class RouteViewModel: ObservableObject {
             if needsBackend && !settings.backendUrl.isEmpty {
                 isResolving = true
                 let tesla = TeslaService()
+                // Use GPS location > home address > nil as origin for place searches
+                let resolveOrigin = parsed.origin
+                    ?? currentLocation
+                    ?? (settings.homeAddress.isEmpty ? nil : settings.homeAddress)
                 let result = try await tesla.resolveRoute(
                     parsed.stops,
-                    origin: parsed.origin,
+                    origin: resolveOrigin,
                     preferences: parsed.preferences
                 )
                 self.stops = result.stops
                 self.totalDriveMin = result.totalDriveMin
                 self.totalDistanceKm = result.totalDistanceKm
+                self.encodedPolyline = result.encodedPolyline
                 isResolving = false
             }
 
@@ -110,12 +117,13 @@ class RouteViewModel: ObservableObject {
 
     // MARK: - Send to Tesla
 
+    /// Send all stops to selected vehicles as waypoints.
     func sendToSelectedVehicles(tesla: TeslaService) async {
         guard !stops.isEmpty, !selectedVehicleIds.isEmpty else { return }
         isSending = true
         sendStatus = [:]
 
-        let currentStops = stops
+        let allStops = stops
         let vehicleIds = selectedVehicleIds
         let vehicles = tesla.vehicles
 
@@ -128,8 +136,11 @@ class RouteViewModel: ObservableObject {
                 if vehicle?.isOnline == false {
                     try await tesla.wakeVehicle(idStr)
                 }
-                try await tesla.sendRoute(currentStops, to: idStr)
-                sendStatus[vehicleId] = SendStatus(success: true, message: "Route sent to \(name)")
+                try await tesla.sendRoute(allStops, to: idStr, vin: vehicle?.vin)
+                let dest = allStops.count == 1
+                    ? allStops[0].displayName
+                    : "\(allStops.count) stops"
+                sendStatus[vehicleId] = SendStatus(success: true, message: "Sent \(dest) to \(name)")
             } catch {
                 sendStatus[vehicleId] = SendStatus(success: false, message: "\(name): \(error.localizedDescription)")
             }
@@ -243,6 +254,7 @@ class RouteViewModel: ObservableObject {
         preferences = nil
         totalDriveMin = nil
         totalDistanceKm = nil
+        encodedPolyline = nil
         rangeWarning = nil
         errorMessage = nil
         sendStatus = [:]

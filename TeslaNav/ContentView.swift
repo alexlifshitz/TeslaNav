@@ -10,6 +10,7 @@ struct ContentView: View {
     @StateObject private var calendar = CalendarService()
     @StateObject private var contacts = ContactsService()
     @StateObject private var weather = WeatherService()
+    @StateObject private var location = LocationService()
     @State private var showSettings = false
 
     var body: some View {
@@ -34,6 +35,9 @@ struct ContentView: View {
                 }
                 .task { [weather] in
                     await weather.fetchWeather(latitude: 37.7749, longitude: -122.4194)
+                }
+                .task { [location] in
+                    location.requestAccess()
                 }
                 .onChange(of: vm.stops) { _, _ in vm.checkBatteryRange(tesla: tesla) }
                 .onChange(of: vm.selectedVehicleIds) { _, _ in vm.checkBatteryRange(tesla: tesla) }
@@ -61,7 +65,7 @@ struct ContentView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     headerRow
-                    VoiceInputCard(speech: speech, vm: vm, calendar: calendar, contacts: contacts)
+                    VoiceInputCard(speech: speech, vm: vm, calendar: calendar, contacts: contacts, location: location)
                     routeActionsSection
                     VehicleSendSection(tesla: tesla, vm: vm, weather: weather)
                 }
@@ -106,6 +110,7 @@ struct VoiceInputCard: View {
     @ObservedObject var vm: RouteViewModel
     @ObservedObject var calendar: CalendarService
     @ObservedObject var contacts: ContactsService
+    @ObservedObject var location: LocationService
 
     var body: some View {
         VStack(spacing: 14) {
@@ -226,7 +231,8 @@ struct VoiceInputCard: View {
                     Task {
                         await vm.parseAndOptimize(
                             calendarEvents: calendar.upcomingEvents,
-                            contactAddresses: contacts.recentAddresses
+                            contactAddresses: contacts.recentAddresses,
+                            currentLocation: location.coordinateString
                         )
                     }
                 }) {
@@ -366,6 +372,10 @@ struct RouteStopsSection: View {
                 RoutePrefsBadges(prefs: prefs)
             }
 
+            if !vm.isResolving, vm.stops.contains(where: { $0.latitude != nil && $0.longitude != nil }) {
+                RouteMapView(stops: vm.stops, encodedPolyline: vm.encodedPolyline)
+            }
+
             VStack(spacing: 0) {
                 ForEach(Array(vm.stops.enumerated()), id: \.element.id) { idx, stop in
                     RouteStopRow(stop: stop, index: idx, isLast: idx == vm.stops.count - 1)
@@ -416,6 +426,28 @@ struct RouteStopRow: View {
     let stop: RouteStop
     let index: Int
     let isLast: Bool
+    var isCurrent: Bool = false
+    var isSent: Bool = false
+
+    private var badgeFill: Color {
+        if isSent { return Color.green.opacity(0.2) }
+        if isCurrent { return Color(red: 0.28, green: 0.78, blue: 1).opacity(0.2) }
+        if stop.hasConflict { return Color.red.opacity(0.2) }
+        return Color.yellow.opacity(0.15)
+    }
+
+    private var badgeStroke: Color {
+        if isSent { return Color.green.opacity(0.5) }
+        if isCurrent { return Color(red: 0.28, green: 0.78, blue: 1).opacity(0.5) }
+        if stop.hasConflict { return Color.red.opacity(0.5) }
+        return Color.yellow.opacity(0.4)
+    }
+
+    private var badgeTextColor: Color {
+        if isCurrent { return Color(red: 0.28, green: 0.78, blue: 1) }
+        if stop.hasConflict { return .red }
+        return .yellow
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -442,14 +474,20 @@ struct RouteStopRow: View {
             HStack(alignment: .top, spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 7)
-                        .fill(stop.hasConflict ? Color.red.opacity(0.2) : Color.yellow.opacity(0.15))
+                        .fill(badgeFill)
                         .overlay(
                             RoundedRectangle(cornerRadius: 7)
-                                .stroke(stop.hasConflict ? Color.red.opacity(0.5) : Color.yellow.opacity(0.4), lineWidth: 1)
+                                .stroke(badgeStroke, lineWidth: 1)
                         )
-                    Text("\(index + 1)")
-                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                        .foregroundColor(stop.hasConflict ? .red : .yellow)
+                    if isSent {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.green)
+                    } else {
+                        Text("\(index + 1)")
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(badgeTextColor)
+                    }
                 }
                 .frame(width: 28, height: 28)
 
@@ -670,6 +708,9 @@ struct VehicleSendSection: View {
         if vm.isSending { return "Sending..." }
         let count = vm.selectedVehicleIds.count
         if count == 0 { return "Select a car above" }
+        if vm.stops.count > 1 {
+            return "Send \(vm.stops.count) Stops"
+        }
         return "Send to \(count) Car\(count == 1 ? "" : "s")"
     }
 }
