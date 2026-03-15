@@ -26,9 +26,6 @@ class DeepLinkManager: ObservableObject {
         // Apply any config params from URL
         var settings = AppSettings.current
         var changed = false
-        if let key = url.queryValue(for: "claude_key"), !key.isEmpty {
-            settings.claudeApiKey = key; changed = true
-        }
         if let key = url.queryValue(for: "google_key"), !key.isEmpty {
             settings.googleMapsApiKey = key; changed = true
         }
@@ -47,6 +44,15 @@ class DeepLinkManager: ObservableObject {
             }
         case "settings":
             shouldOpenSettings = true
+        case "tesla-auth":
+            if let accessToken = url.queryValue(for: "access_token"), !accessToken.isEmpty {
+                var s = AppSettings.current
+                s.teslaAccessToken = accessToken
+                if let refreshToken = url.queryValue(for: "refresh_token"), !refreshToken.isEmpty {
+                    s.teslaRefreshToken = refreshToken
+                }
+                AppSettings.current = s
+            }
         default:
             break
         }

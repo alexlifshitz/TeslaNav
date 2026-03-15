@@ -31,8 +31,6 @@ class TeslaService: ObservableObject {
         let settings = AppSettings.current
         var h = ["Authorization": "Bearer \(settings.teslaAccessToken)",
                  "Content-Type": "application/json"]
-        let gmKey = settings.googleMapsApiKey
-        if !gmKey.isEmpty { h["X-Google-Maps-Key"] = gmKey }
         let rt = settings.teslaRefreshToken
         if !rt.isEmpty { h["X-Refresh-Token"] = rt }
         return h
